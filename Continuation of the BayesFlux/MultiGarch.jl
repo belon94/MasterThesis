@@ -6,11 +6,13 @@
 
 
 
+
 using BayesFlux, Flux
 using Random, Distributions
-using StatsPlots, Optim
+using StatsPlots, Optim, 
 using ARCHModels, LinearAlgebra, DataFrames, CSV, Plots, Statistics
 using MCMCChains, Bijectors
+using SpecialFunctions
 
 Random.seed!(6150533)
 
@@ -322,6 +324,7 @@ dcc_results = dcc_garch(returns)
 analyse_results(dcc_results, etf_names, returns)
 
 #### Now also I will compute the DCC-GARCH model with t-distribution
+
 # GARCH(1,1) with t-distribution likelihood for parameter estimation
 function t_garch_likelihood(params, returns)
     ω, α, β, df = params  # Added degrees of freedom parameter
@@ -331,7 +334,7 @@ function t_garch_likelihood(params, returns)
     loglik = 0.0
     
     # Constants for t-distribution
-    logconst = lgamma((df + 1)/2) - lgamma(df/2) - 0.5*log(π*df)
+    logconst = loggamma((df + 1)/2) - loggamma(df/2) - 0.5*log(π*df)
     
     for t in 2:n
         σ²[t] = max(ω + α * returns[t-1]^2 + β * σ²[t-1], 1e-6)
@@ -382,6 +385,9 @@ function t_dcc_likelihood(params, std_returns, Q_bar, df_vector)
     Qt .= Q_bar
     loglik = 0.0
     
+    # Use average df for simplicity
+    avg_df = mean(df_vector)
+    
     for t in 2:T
         Qt = (1 - a - b) * Q_bar + 
              a * (std_returns[t-1,:] * std_returns[t-1,:]') + 
@@ -393,37 +399,19 @@ function t_dcc_likelihood(params, std_returns, Q_bar, df_vector)
         Qt_diag = Diagonal(sqrt.(diag(Qt)))
         Rt = inv(Qt_diag) * Qt * inv(Qt_diag)
         
-        # Multivariate t-distribution log-likelihood
-        # Using average df for simplicity - could be more complex in a full implementation
-        avg_df = mean(df_vector)
+        # Multivariate t-distribution log-likelihood component
         v = std_returns[t,:]' * inv(Rt) * std_returns[t,:]
         
-        loglik += lgamma((avg_df + N)/2) - lgamma(avg_df/2) - (N/2)*log(π*avg_df) -
+        loglik += loggamma((avg_df + N)/2) - loggamma(avg_df/2) - (N/2)*log(π*avg_df) -
                  0.5*log(det(Rt)) - ((avg_df + N)/2)*log(1 + v/avg_df)
     end
     
     return -loglik
 end
 
-# Main DCC-GARCH function with t-distribution
-function t_dcc_garch(returns)
-    n, N = size(returns)
-    
-    # First stage: Fit univariate t-GARCH models
-    volatilities = zeros(n + 1, N)
-    std_returns = zeros(n, N)
-    t_garch_params = Vector{Tuple{Float64, Float64, Float64, Float64}}(undef, N)
-    
-    for i in 1:N
-        volatilities[:, i], t_garch_params[i] = fit_univariate_t_garch(returns[:, i])
-        std_returns[:, i] = returns[:, i] ./ sqrt.(volatilities[1:end-1, i])
-    end
-    
-    # Extract degrees of freedom from each univariate model
-    df_vector = [params[4] for params in t_garch_params]
-    
-    # Second stage: DCC estimation with t-distribution
-    Q_bar = cor(returns)
+# Estimate DCC parameters with t-distribution
+function estimate_t_dcc_params(std_returns, df_vector)
+    Q_bar = cor(std_returns)
     
     function obj(params)
         a, b = params
@@ -435,14 +423,40 @@ function t_dcc_garch(returns)
     
     initial_params = [0.01, 0.97]
     result = optimize(obj, initial_params, BFGS())
-    a, b = Optim.minimizer(result)
+    return Optim.minimizer(result)
+end
+
+# Main DCC-GARCH function with t-distribution
+function t_dcc_garch(returns)
+    n, N = size(returns)
+    
+    # First stage: Fit univariate t-GARCH models
+    volatilities = zeros(n + 1, N)
+    std_returns = zeros(n, N)
+    t_garch_params = Vector{Tuple{Float64, Float64, Float64, Float64}}(undef, N)
+    
+    println("Fitting univariate t-GARCH models...")
+    for i in 1:N
+        println("Processing asset $i of $N")
+        volatilities[:, i], t_garch_params[i] = fit_univariate_t_garch(returns[:, i])
+        std_returns[:, i] = returns[:, i] ./ sqrt.(volatilities[1:end-1, i])
+    end
+    
+    # Extract degrees of freedom from each univariate model
+    df_vector = [params[4] for params in t_garch_params]
+    
+    # Second stage: DCC estimation with t-distribution
+    println("Estimating DCC parameters...")
+    a, b = estimate_t_dcc_params(std_returns, df_vector)
     
     # Compute time-varying matrices
+    Q_bar = cor(returns)
     Q_t = zeros(n, N, N)
     R_t = zeros(n, N, N)
     H_t = zeros(n, N, N)
     Q_t[1, :, :] = Q_bar
     
+    println("Computing time-varying matrices...")
     for t in 2:n
         Q_t[t, :, :] = (1 - a - b) * Q_bar + 
                        a * (std_returns[t-1, :] * std_returns[t-1, :]') + 
@@ -493,8 +507,11 @@ function analyse_t_results(t_dcc_results, etf_names, returns)
     end
     
     println("\nAverage degrees of freedom: ", mean(t_dcc_results["degrees_of_freedom"]))
+    println("Min degrees of freedom: ", minimum(t_dcc_results["degrees_of_freedom"]))
+    println("Max degrees of freedom: ", maximum(t_dcc_results["degrees_of_freedom"]))
 end
 
 # Fit t-distribution model
+println("Starting DCC-GARCH with t-distribution estimation...")
 t_dcc_results = t_dcc_garch(returns)
 analyse_t_results(t_dcc_results, etf_names, returns)

@@ -6,9 +6,9 @@
 
 
 
-using .BayesFlux, Flux
+using BayesFlux, Flux
 using Random, Distributions
-using StatsPlots
+using StatsPlots, Optim
 using ARCHModels, LinearAlgebra, DataFrames, CSV, Plots, Statistics
 using MCMCChains, Bijectors
 

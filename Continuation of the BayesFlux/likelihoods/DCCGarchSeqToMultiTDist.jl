@@ -1,6 +1,5 @@
 ### The likelihood for a DCC-GARCH model with a t-Student distribution
 
-module DCC_BNN_GarchTDist
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  DCC‑GARCH likelihood with multivariate Student‑t errors inside a Bayesian
@@ -182,4 +181,3 @@ end
 
 export DCCGarchTDist, posterior_predict, transform_ab
 
-end # module

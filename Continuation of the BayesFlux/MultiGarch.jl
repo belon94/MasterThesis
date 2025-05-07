@@ -5,8 +5,6 @@
 ### to compute the DCC-GARCH model, The package ARCHModels.jl will be used 
 
 
-
-
 using BayesFlux, Flux
 using Random, Distributions
 using StatsPlots, Optim, 

@@ -1,7 +1,5 @@
 ### The likelihood for a DCC-GARCH model with a multivariate Normal distribution
 
-module DCC_BNN_GarchNormal
-
 using BayesFlux
 using LinearAlgebra, Statistics, Distributions
 
@@ -25,7 +23,7 @@ function nearest_pd(A)
     F = eigen(B)
     
     # Replace negative eigenvalues with small positive values
-    D = Diagonal(max.(F.values, 1e-6))
+    D = Diagonal(max.(F.values, 1e-10))
     
     # Reconstruct matrix
     return F.vectors * D * F.vectors'
@@ -263,4 +261,3 @@ function sigmoid(x)
 end
 
 export NetConstructor, DCCGarchNormal, posterior_predict
-end # module

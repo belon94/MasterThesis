@@ -1,4 +1,4 @@
-include("/Users/kevin/Documents/University of Maastricht /Master Econometrics and Operations Research/Master Thesis /MasterThesis/Continuation of the BayesFlux/BayesFlux.jl")
+include("BayesFlux.jl")
 using Flux
 using Random, Distributions, LinearAlgebra, Plots
 using MCMCChains, Bijectors

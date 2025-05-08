@@ -28,8 +28,8 @@ export SeqToOneNormal, SeqToOneTDist
 
 #####Trial likelihoods
 include("./likelihoods/arch_seq_to_one.jl")
-include("/Users/kevin/Documents/University of Maastricht /Master Econometrics and Operations Research/Master Thesis /MasterThesis/Continuation of the BayesFlux/likelihoods/DCCGarchSeqToMultiNormal.jl")
-include("/Users/kevin/Documents/University of Maastricht /Master Econometrics and Operations Research/Master Thesis /MasterThesis/Continuation of the BayesFlux/likelihoods/DCCGarchSeqToMultiNormal.jl")
+include("/Users/kevin/Documents/University of Maastricht /Master Econometrics and Operations Research/Master Thesis /MasterThesis/Continuation of the BayesFlux/scr/likelihoods/DCCGarchSeqToMultiNormal.jl")
+include("/Users/kevin/Documents/University of Maastricht /Master Econometrics and Operations Research/Master Thesis /MasterThesis/Continuation of the BayesFlux/scr/likelihoods/DCCGarchSeqToMultiTDist.jl")
 include("./likelihoods/garch_seq_to_one.jl")
 export ArchSeqToOneNormal
 export ArchSeqToOneTDist

@@ -1,6 +1,6 @@
-### The likelihood for a DCC-GARCH model with a multivariate Normal distribution
-
-using BayesFlux
+# DCC-GARCH Normal Likelihood for Bayesian Neural Networks
+# This code implements a DCC-GARCH model with normal errors for Bayesian neural networks.   
+# It includes functions for transforming parameters, computing the log-likelihood,
 using LinearAlgebra, Statistics, Distributions
 
 struct DCCGarchNormal{T,F,D<:Distributions.Distribution} <: BNNLikelihood
@@ -88,30 +88,15 @@ function (l::DCCGarchNormal{T,F,D})(x::Array{T,3}, y::Matrix{T},
     Dt = Diagonal(σ[:, t])  # Using standard deviation directly
     H_t = Dt * R * Dt
     
-    # Use Cholesky decomposition with checking enabled
-    try
-        Hchol = cholesky(H_t; check=true)
-        
-        # Compute log-likelihood contribution
-        diff = y[:, t] .- μ[:, t]
-        quad = sum(abs2, Hchol.L \ diff)
-        
-        logl -= 0.5 * (N * log(2π) + 2*sum(log, diag(Hchol.L)) + quad)
-    catch e
-        if isa(e, LinearAlgebra.PosDefException)
-            # Fix the non-positive definite matrix
-            H_t = nearest_pd(H_t)
-            Hchol = cholesky(H_t)
-            
-            # Compute log-likelihood contribution
-            diff = y[:, t] .- μ[:, t]
-            quad = sum(abs2, Hchol.L \ diff)
-            
-            logl -= 0.5 * (N * log(2π) + 2*sum(log, diag(Hchol.L)) + quad)
-        else
-            rethrow(e)
-        end
-    end
+    # Always ensure H_t is positive definite - no try/catch for Zygote compatibility
+    H_t = nearest_pd(H_t)
+    Hchol = cholesky(H_t)
+    
+    # Compute log-likelihood contribution
+    diff = y[:, t] .- μ[:, t]
+    quad = sum(abs2, Hchol.L \ diff)
+    
+    logl -= 0.5 * (N * log(2π) + 2*sum(log, diag(Hchol.L)) + quad)
     
     # Update Q for second time step using first observation
     if Tsteps > 1
@@ -129,30 +114,15 @@ function (l::DCCGarchNormal{T,F,D})(x::Array{T,3}, y::Matrix{T},
         Dt = Diagonal(σ[:, t])  # Using standard deviation directly
         H_t = Dt * R * Dt
         
-        # Use Cholesky decomposition with checking enabled
-        try
-            Hchol = cholesky(H_t; check=true)
-            
-            # Compute log-likelihood contribution
-            diff = y[:, t] .- μ[:, t]
-            quad = sum(abs2, Hchol.L \ diff)
-            
-            logl -= 0.5 * (N * log(2π) + 2*sum(log, diag(Hchol.L)) + quad)
-        catch e
-            if isa(e, LinearAlgebra.PosDefException)
-                # Fix the non-positive definite matrix
-                H_t = nearest_pd(H_t)
-                Hchol = cholesky(H_t)
-                
-                # Compute log-likelihood contribution
-                diff = y[:, t] .- μ[:, t]
-                quad = sum(abs2, Hchol.L \ diff)
-                
-                logl -= 0.5 * (N * log(2π) + 2*sum(log, diag(Hchol.L)) + quad)
-            else
-                rethrow(e)
-            end
-        end
+        # Always ensure H_t is positive definite - no try/catch for Zygote compatibility
+        H_t = nearest_pd(H_t)
+        Hchol = cholesky(H_t)
+        
+        # Compute log-likelihood contribution
+        diff = y[:, t] .- μ[:, t]
+        quad = sum(abs2, Hchol.L \ diff)
+        
+        logl -= 0.5 * (N * log(2π) + 2*sum(log, diag(Hchol.L)) + quad)
         
         # Update Q for next time step using current observation
         if t < Tsteps
@@ -234,16 +204,8 @@ function posterior_predict(l::DCCGarchNormal{T,F,D},
     μp = μ[:, end]
     Hp = Diagonal(σ[:, end]) * R * Diagonal(σ[:, end])  # Using standard deviation directly
     
-    # Make sure Hp is positive definite
-    try
-        cholesky(Hp; check=true)
-    catch e
-        if isa(e, LinearAlgebra.PosDefException)
-            Hp = nearest_pd(Hp)
-        else
-            rethrow(e)
-        end
-    end
+    # Make sure Hp is positive definite - no try/catch for Zygote compatibility
+    Hp = nearest_pd(Hp)
     
     # Generate prediction
     return rand(MvNormal(μp, Hp))

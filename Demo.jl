@@ -1,8 +1,7 @@
-include("BayesFlux.jl")
 using Flux
 using Random, Distributions, LinearAlgebra, Plots
 using MCMCChains, Bijectors
-using .BayesFlux
+using BayesFlux
 Random.seed!(1212)
 
 # Sample size

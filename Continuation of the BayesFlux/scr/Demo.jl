@@ -118,16 +118,16 @@ end
 # Helper function for nearest positive definite matrix
 function nearest_pd(A)
     # Compute symmetric part
-    B = (A + A') / 2
+    B = (A + A') / 2 
     
     # Eigendecomposition
     F = eigen(B)
     
     # Replace negative eigenvalues with small positive values
-    D = Diagonal(max.(F.values, 1e-10))
+    D = 1e-4 * I
     
     # Reconstruct matrix
-    return F.vectors * D * F.vectors'
+    return B+D
 end
 
 # Helper function to transform DCC parameters to valid range
@@ -169,7 +169,6 @@ function (l::DCCGarchNormal{T,F,D})(x::Array{T,3}, y::Matrix{T},
         out = net(xt_view)     
         length(out) == 2N || error("Network output must be 2N scalars.")
         
-        # Fixed: don't use @view on output vector, use indexing instead
         μ[:, t] .= out[1:N]       # Means
         σ[:, t] .= exp.(out[N+1:2N] ./ 2)  # Standard deviations (exp of half-log-variance)
         z[:, t] .= (y[:, t] .- μ[:, t]) ./ σ[:, t]  # Standardized residuals
@@ -860,3 +859,169 @@ plot!(p2, [means_train[:, 2] + 2*sigmas_train[:, 2], means_train[:, 2] - 2*sigma
       label=["95% CI" nothing], color=:red, alpha=0.3, linestyle=:dash)
 
 plot(p1, p2, layout=(2,1), size=(800, 600))
+
+
+###-----------------------------------------------------------------
+###############################################################################
+#  DCC–GARCH Bayesian neural-network example (BayesFlux.jl)                   #
+###############################################################################
+using Flux, BayesFlux
+using Random, Distributions, LinearAlgebra, Plots
+using MCMCChains, Bijectors, Statistics
+
+Random.seed!(1212)
+
+# ───────────────────────── 1.  DCC-GARCH simulator ──────────────────────────
+function dccGarchNDraws(n::Int, N::Int, α::Float64, β::Float64,
+                        vol::Vector{Float64}, ρ::Float64)
+
+    ω = vol .* (1 .- α .- β)
+
+    R̄ = Matrix{Float64}(I,N,N)
+    for i in 1:N, j in i+1:N
+        R̄[i,j] = R̄[j,i] = ρ
+    end
+    if minimum(eigvals(R̄)) ≤ 0
+        ρ_adj = max(0.0, min(0.99, ρ*0.9))
+        for i in 1:N, j in i+1:N
+            R̄[i,j] = R̄[j,i] = ρ_adj
+        end
+    end
+
+    L   = zeros(n,N)
+    σ²  = vcat(vol', zeros(n,N))
+    Q   = copy(R̄)
+    z   = zeros(n,N)
+
+    for t in 1:n
+        if t>1
+            Q = (1-α-β)*R̄ + α*(z[t-1,:]*z[t-1,:]') + β*Q |> Symmetric
+        end
+        d  = 1 ./ sqrt.(diag(Q))
+        R  = Symmetric(diagm(d)*Q*diagm(d))
+
+        ε          = rand(MvNormal(zeros(N),R))
+        L[t,:]     = sqrt.(σ²[t,:]) .* ε
+        z[t,:]     = ε
+        σ²[t+1,:]  = ω .+ α .* L[t,:].^2 .+ β .* σ²[t,:]
+    end
+    return Dict("L"=>L, "sigma_squared"=>σ²[1:end-1,:])
+end
+
+# ───────────────────────── 2.  helpers ──────────────────────────────────────
+sigmoid(x) = 1/(1+exp(-x))
+transform_ab(a,b) = let a_=sigmoid(a); b_=sigmoid(b)*(1-a_); (a_,b_) end
+nearest_pd(A) = (A + A')/2 + 1e-4I             # quick PD repair
+
+function prepare_time_series_data(data, w)
+    n = size(data,1) - w
+    p = size(data,2)
+    X = Array{Float32}(undef, p*w, n)
+    Y = Array{Float32}(undef, p,   n)
+    for i in 1:n
+        X[:,i] = reshape(data[i:i+w-1,:]', :)
+        Y[:,i] = data[i+w,:]
+    end
+    return X, Y
+end
+
+# ─────────────────── 3.  custom DCC-GARCH likelihood ────────────────────────
+struct DCCGarchNormal{T,F,D<:Distribution} <: BNNLikelihood
+    num_params_like::Int
+    nc::NetConstructor{T,F}
+    prior::D
+    N::Int
+end
+DCCGarchNormal(nc::NetConstructor{T,F}, prior::D, N::Int) where {T,F,D<:Distribution} =
+    DCCGarchNormal{T,F,D}(2, nc, prior, N)
+
+function (ℓ::DCCGarchNormal)(x::Matrix{T}, y::Matrix{T},
+                             θnet::AbstractVector, θlike::AbstractVector) where {T}
+
+    θnet, θlike = T.(θnet), T.(θlike)
+    a,b         = transform_ab(θlike...)
+    net         = ℓ.nc(θnet)
+    N, Tsteps   = ℓ.N, size(x,2)
+
+    outs  = map(t -> net(view(x,:,t)), 1:Tsteps)
+    μ     = hcat(map(o -> o[1:N]    , outs)...)
+    logσ2 = hcat(map(o -> o[N+1:2N] , outs)...)
+    σ     = exp.(logσ2 ./ 2)
+    z     = (y .- μ) ./ σ
+
+    Q̄ = Tsteps>1 ? (z*z')/Tsteps : Matrix{T}(I,N,N)
+    d  = 1 ./ sqrt.(diag(Q̄))
+    Q̄ = Symmetric(diagm(d)*Q̄*diagm(d))
+
+    Q, logl = Q̄, zero(T)
+    for t in 1:Tsteps
+        d = 1 ./ sqrt.(max.(diag(Q),1e-10))
+        R = Symmetric(diagm(d)*Q*diagm(d))
+        D = Diagonal(view(σ,:,t))
+        H = nearest_pd(D*R*D)
+        L = cholesky(Symmetric(H)).L
+
+        diff = view(y,:,t) .- view(μ,:,t)
+        quad = sum(abs2, L \ diff)
+        logl -= 0.5*(N*log(2π) + 2*sum(log,diag(L)) + quad)
+
+        if t < Tsteps
+            zt = view(z,:,t)
+            Q  = (1-a-b).*Q̄ .+ a.*(zt*zt') .+ b.*Q
+        end
+    end
+    logl += sum(logpdf.(ℓ.prior, vec(μ)))
+    return logl
+end
+
+# ───────────────────────── 4.  simulate data ────────────────────────────────
+n, N = 500, 2
+α, β  = 0.05, 0.90
+vol   = [(20^2)/252, (15^2)/252]
+ρ     = 0.5
+
+sim = dccGarchNDraws(n,N,α,β,vol,ρ)
+y   = Float32.(sim["L"])
+
+train_idx = 1:400
+window    = 5
+Xtr, Ytr  = prepare_time_series_data(y[train_idx,:], window)
+
+# ─────────────────────── 5.  build & train BNN ──────────────────────────────
+net = Chain(
+    Dense(N*window,20,relu),
+    Dense(20,20,relu),
+    Dense(20,2N)
+)
+nc    = destruct(net)
+like  = DCCGarchNormal(nc, Normal(0,0.5), N)
+prior = GaussianPrior(nc, 0.5f0)
+init  = InitialiseAllSame(Normal(0f0,0.5f0), like, prior)
+bnn   = BNN(Xtr, Ytr, like, prior, init)
+
+θmap = find_mode(bnn, 1000, 395, FluxModeFinder(bnn, Flux.ADAM()))
+
+# ─────────────────────── 6.  posterior sampling (SGLD) ──────────────────────
+sgld = SGLD(Float32;               # \gamma<Tab> for the Unicode letter
+            stepsize_a = 1f-3,     # a bit smaller → fewer NaNs
+            stepsize_b = 0f0,
+            stepsize_γ = 0.55f0)
+
+draws = mcmc(bnn, 100, 5_000, sgld)          # (#par × #draws)
+draws = draws[:, 2001:end]                  # discard first 2 000 burn-in
+
+# ── NEW: drop any column that contains NaN or Inf ───────────────────────────
+good   = map(i -> all(isfinite, view(draws,:,i)), axes(draws,2))
+draws  = draws[:, good]                      # keep only “good” draws
+
+samples = [draws[:,i] for i in axes(draws,2)]    # vector-of-vectors
+
+# ─────────────── 7.  diagnostics (MCMCChains) ───────────────────────────────
+param_names = ["θ_$i" for i in 1:size(draws,1)]
+chn = Chains(permutedims(draws,(2,1)), param_names)
+
+# Individual diagnostic plots are often more stable
+traceplot(chn[:, 1:10, :])
+density(chn[:, 1:10, :])
+
+

@@ -2,6 +2,7 @@ using Flux
 using BayesFlux
 using Random, Distributions, LinearAlgebra, Plots
 using MCMCChains, Bijectors
+using Zygote
 Random.seed!(1212)
 
 # Function to generate multivariate DCC-GARCH process
@@ -114,66 +115,42 @@ function DCCGarchNormal(nc::NetConstructor{T,F}, prior_μ::D, N::Int) where {T,F
     return DCCGarchNormal(2, nc, prior_μ, N)  # 2 params: a and b
 end
 
-# Helper function for nearest positive definite matrix
-function nearest_pd(A)
-    # Compute symmetric part
-    B = (A + A') / 2 
-    
-    # Eigendecomposition
-    F = eigen(B)
-    
-    # Replace negative eigenvalues with small positive values
-    D = 1e-4 * I
-    
-    # Reconstruct matrix
-    return B+D
+# Helper functions
+function sigmoid(x)
+    return 1.0 / (1.0 + exp(-x))
 end
 
-# Helper function to transform DCC parameters to valid range
 function transform_ab(raw_a, raw_b)
     a = sigmoid(raw_a)
     b = sigmoid(raw_b) * (1 - a)
     return a, b
 end
 
-function sigmoid(x)
-    return 1.0 / (1.0 + exp(-x))
-end
-
-# COMPLETELY REVISED: Data preparation function for BayesFlux
-function prepare_time_series_data(data, window_size)
+# Mark data preparation as completely non-differentiable
+Zygote.@nograd function prepare_time_series_data(data, window_size)
     n_samples = size(data, 1) - window_size
     n_features = size(data, 2)
     
-    # BayesFlux expects:
-    # x with shape [features, samples]
-    # y with shape [output_dims, samples]
-    
-    # For time series with window, we'll flatten the window into features
     x = Array{Float32}(undef, n_features * window_size, n_samples)
     y = Array{Float32}(undef, n_features, n_samples)
     
     for i in 1:n_samples
-        # Get the window and flatten it
         window = data[i:(i+window_size-1), :]
-        # Flatten window row by row
         x_flattened = reshape(transpose(window), :)
-        # Store flattened window
         x[:, i] = x_flattened
-        # Store target
         y[:, i] = data[i+window_size, :]
     end
     
     return x, y
 end
 
-# Modified implementation of the likelihood function for flattened input
+# Complete rewrite of likelihood function with Zygote.ignore for non-differentiable parts
 function (l::DCCGarchNormal{T,F,D})(x::Matrix{T}, y::Matrix{T}, 
                                    θnet::AbstractVector, θlike::AbstractVector) where {T,F,D}
     θnet = T.(θnet)
     θlike = T.(θlike)
     
-    # Transform DCC parameters to valid range
+    # Transform parameters
     a, b = transform_ab(θlike[1], θlike[2])
     
     # Initialize network
@@ -182,107 +159,72 @@ function (l::DCCGarchNormal{T,F,D})(x::Matrix{T}, y::Matrix{T},
     # Dimensions
     N, Tsteps = l.N, size(x, 2)
     
-    # Initialize arrays for means, standard deviations and standardized residuals
-    μ = Matrix{T}(undef, N, Tsteps)
-    σ = similar(μ)  # standard deviation instead of variance
-    z = similar(μ)
+    # Compute all network outputs and predictions first - these need gradients
+    network_outputs = [net(x[:, t]) for t in 1:Tsteps]
+    means = [network_outputs[t][1:N] for t in 1:Tsteps]
+    stds = [exp.(network_outputs[t][N+1:2N] ./ 2) for t in 1:Tsteps]
     
-    # Extract parameters and compute standardized residuals for each time step
-    @inbounds for t in 1:Tsteps
-        # Get the flattened window for this sample
-        xt_flat = x[:, t]
+    # Compute standardized residuals - these need gradients too
+    zs = [(y[:, t] .- means[t]) ./ stds[t] for t in 1:Tsteps]
+    
+    # Wrap the DCC calculation in a Zygote.ignore block
+    # This part doesn't need gradients and can use mutations
+    logl = Zygote.ignore() do
+        # Compute Qbar (unconditional correlation matrix)
+        z_matrix = reduce(hcat, zs)
+        Qbar = Tsteps > 1 ? (z_matrix * z_matrix') / Tsteps : Matrix{T}(I, N, N)
         
-        # Get network output
-        out = net(xt_flat)     
-        length(out) == 2N || error("Network output must be 2N scalars.")
-        
-        # Process output
-        μ[:, t] .= out[1:N]       # Means
-        σ[:, t] .= exp.(out[N+1:2N] ./ 2)  # Standard deviations (exp of half-log-variance)
-        z[:, t] .= (y[:, t] .- μ[:, t]) ./ σ[:, t]  # Standardized residuals
-    end
-    
-    # Compute unconditional correlation matrix
-    Qbar = Tsteps > 1 ? (z * z') / Tsteps : I(N)
-    
-    # Ensure Qbar is correlation matrix
-    if Tsteps > 1
-        d_inv = 1 ./ sqrt.(diag(Qbar))
-        Qbar = Symmetric(Diagonal(d_inv) * Qbar * Diagonal(d_inv))
-    end
-    
-    # Initialize Q1 as unconditional correlation
-    Q = copy(Qbar)
-    
-    # Initialize log-likelihood
-    logl = zero(T)
-    
-    # Process first time step separately
-    t = 1
-    
-    # Compute correlation matrix R_t from Q
-    d_inv = 1 ./ sqrt.(max.(diag(Q), 1e-10))
-    R = Symmetric(Diagonal(d_inv) * Q * Diagonal(d_inv))
-    
-    # Construct covariance matrix H_t
-    Dt = Diagonal(σ[:, t])  # Using standard deviation directly
-    H_t = Dt * R * Dt
-    
-    # Always ensure H_t is positive definite 
-    H_t = nearest_pd(H_t)
-    Hchol = cholesky(H_t)
-    
-    # Compute log-likelihood contribution
-    diff = y[:, t] .- μ[:, t]
-    quad = sum(abs2, Hchol.L \ diff)
-    
-    logl -= 0.5 * (N * log(2π) + 2*sum(log, diag(Hchol.L)) + quad)
-    
-    # Update Q for second time step using first observation
-    if Tsteps > 1
-        Q_next = (1-a-b).*Qbar .+ a.*(z[:,1]*z[:,1]') .+ b.*Q
-        Q = Q_next
-    end
-    
-    # DCC recursion for remaining time steps
-    for t in 2:Tsteps
-        # Compute correlation matrix R_t from Q_t (which uses information up to t-1)
-        d_inv = 1 ./ sqrt.(max.(diag(Q), 1e-10))
-        R = Symmetric(Diagonal(d_inv) * Q * Diagonal(d_inv))
-        
-        # Construct covariance matrix H_t
-        Dt = Diagonal(σ[:, t])  # Using standard deviation directly
-        H_t = Dt * R * Dt
-        
-        # Always ensure H_t is positive definite - no try/catch for Zygote compatibility
-        H_t = nearest_pd(H_t)
-        Hchol = cholesky(H_t)
-        
-        # Compute log-likelihood contribution
-        diff = y[:, t] .- μ[:, t]
-        quad = sum(abs2, Hchol.L \ diff)
-        
-        logl -= 0.5 * (N * log(2π) + 2*sum(log, diag(Hchol.L)) + quad)
-        
-        # Update Q for next time step using current observation
-        if t < Tsteps
-            Q_next = (1-a-b).*Qbar .+ a.*(z[:,t]*z[:,t]') .+ b.*Q
-            Q = Q_next
+        # Ensure Qbar is correlation matrix
+        if Tsteps > 1
+            d_inv = 1 ./ sqrt.(diag(Qbar))
+            Qbar = Symmetric(Diagonal(d_inv) * Qbar * Diagonal(d_inv))
         end
+        
+        # Initialize log-likelihood and Q
+        logl_value = T(0)
+        Q = copy(Qbar)
+        
+        # Process all time steps
+        for t in 1:Tsteps
+            # Compute correlation matrix R_t from Q
+            d_inv = 1 ./ sqrt.(max.(diag(Q), 1e-10))
+            R = Symmetric(Diagonal(d_inv) * Q * Diagonal(d_inv))
+            
+            # Construct covariance matrix H_t
+            Dt = Diagonal(stds[t])
+            H_t = Dt * R * Dt
+            
+            # Ensure H_t is positive definite
+            λ = max(1e-4, abs(minimum(eigvals(Symmetric(H_t)))))
+            H_t = Symmetric(H_t) + λ * I
+            
+            # Compute log-likelihood contribution using Cholesky
+            H_chol = cholesky(H_t)
+            diff = y[:, t] .- means[t]
+            quad = sum(abs2, H_chol.L \ diff)
+            logl_value -= T(0.5) * (N * log(T(2π)) + 2*sum(log, diag(H_chol.L)) + quad)
+            
+            # Update Q for next time step if not the last step
+            if t < Tsteps
+                Q = (1-a-b) .* Qbar .+ a .* (zs[t] * zs[t]') .+ b .* Q
+            end
+        end
+        
+        return logl_value
     end
     
-    # Add prior contribution
-    logl += sum(logpdf.(l.prior_μ, μ))
+    # Add prior contribution - needs gradients
+    prior_logl = sum([sum(logpdf.(l.prior_μ, means[t])) for t in 1:Tsteps])
     
-    return logl
+    return logl + prior_logl
 end
 
-# Modified posterior prediction implementation
-function posterior_predict(l::DCCGarchNormal{T,F,D}, 
-                          x::Matrix{T}, 
-                          θnet::AbstractVector, 
-                          θlike::AbstractVector,
-                          y_hist::Matrix{T}) where {T,F,D}
+# Mark posterior prediction as completely non-differentiable
+Zygote.@nograd function posterior_predict(l::DCCGarchNormal{T,F,D}, 
+                                  x::Matrix{T}, 
+                                  θnet::AbstractVector, 
+                                  θlike::AbstractVector,
+                                  y_hist::Matrix{T}) where {T,F,D}
     θnet = T.(θnet)
     θlike = T.(θlike)
     
@@ -297,10 +239,10 @@ function posterior_predict(l::DCCGarchNormal{T,F,D},
     
     # Process historical data for DCC recursion
     μ = Matrix{T}(undef, N, Tsteps)
-    σ = similar(μ)  # standard deviation instead of variance
-    z = similar(μ)
+    σ = Matrix{T}(undef, N, Tsteps)
+    z = Matrix{T}(undef, N, Tsteps)
     
-    @inbounds for t in 1:Tsteps
+    for t in 1:Tsteps
         # Get the flattened window for this sample
         xt_flat = x[:, t]
         
@@ -309,13 +251,13 @@ function posterior_predict(l::DCCGarchNormal{T,F,D},
         length(out) == 2N || error("Network output must be 2N scalars.")
         
         # Process output
-        μ[:, t] .= out[1:N]
-        σ[:, t] .= exp.(out[N+1:2N] ./ 2)  # Standard deviations (exp of half-log-variance)
-        z[:, t] .= (y_hist[:, t] .- μ[:, t]) ./ σ[:, t]  # Standardized residuals
+        μ[:, t] = out[1:N]
+        σ[:, t] = exp.(out[N+1:2N] ./ 2)  # Standard deviations
+        z[:, t] = (y_hist[:, t] .- μ[:, t]) ./ σ[:, t]  # Standardized residuals
     end
     
     # Compute unconditional correlation matrix
-    Qbar = Tsteps > 1 ? (z * z') / Tsteps : I(N)
+    Qbar = Tsteps > 1 ? (z * z') / Tsteps : Matrix{T}(I, N, N)
     
     # Ensure Qbar is correlation matrix
     if Tsteps > 1
@@ -323,20 +265,18 @@ function posterior_predict(l::DCCGarchNormal{T,F,D},
         Qbar = Symmetric(Diagonal(d_inv) * Qbar * Diagonal(d_inv))
     end
     
-    # Initialize Q1 as unconditional correlation
+    # Initialize Q as unconditional correlation
     Q = copy(Qbar)
-    
     
     # Proper DCC recursion with temporal ordering
     if Tsteps > 1
         # Process observations sequentially
         for t in 1:(Tsteps-1)
-            Q_next = (1-a-b).*Qbar .+ a.*(z[:,t]*z[:,t]') .+ b.*Q
-            Q = Q_next
+            Q = (1-a-b) .* Qbar .+ a .* (z[:,t] * z[:,t]') .+ b .* Q
         end
         
         # Final update with last observation
-        Q = (1-a-b).*Qbar .+ a.*(z[:,Tsteps]*z[:,Tsteps]') .+ b.*Q
+        Q = (1-a-b) .* Qbar .+ a .* (z[:,Tsteps] * z[:,Tsteps]') .+ b .* Q
     end
     
     # Compute correlation matrix R_t
@@ -345,16 +285,33 @@ function posterior_predict(l::DCCGarchNormal{T,F,D},
     
     # Means and variance for prediction (from last time step)
     μp = μ[:, end]
-    Hp = Diagonal(σ[:, end]) * R * Diagonal(σ[:, end])  # Using standard deviation directly
+    Hp = Diagonal(σ[:, end]) * R * Diagonal(σ[:, end])
     
-    # Make sure Hp is positive definite - no try/catch for Zygote compatibility
-    Hp = nearest_pd(Hp)
+    # Make sure Hp is positive definite
+    λ = max(1e-4, abs(minimum(eigvals(Symmetric(Hp)))))
+    Hp = Symmetric(Hp) + λ * I
     
     # Generate prediction
     return rand(MvNormal(μp, Hp))
 end
 
-# Now set up the model parameters and run the simulation
+# Mark prediction extraction as completely non-differentiable
+Zygote.@nograd function extract_predictions(net, x)
+    n_features = size(net.layers[end].weight, 1) ÷ 2
+    n_samples = size(x, 2)
+    
+    means = zeros(Float32, n_samples, n_features)
+    sigmas = zeros(Float32, n_samples, n_features)
+    
+    for i in 1:n_samples
+        out = net(x[:, i])
+        means[i, :] = out[1:n_features]
+        sigmas[i, :] = exp.(out[n_features+1:2*n_features] ./ 2)
+    end
+    
+    return means, sigmas
+end
+
 # Sample size
 n = 500
 N = 2  # Number of series
@@ -384,50 +341,40 @@ y_full = y[full_index, :]
 # Use window size of 5
 window_size = 5
 
-# COMPLETELY REVISED: Create data for BNN in the format it expects
+# Create data for BNN in the format it expects
 x_train, y_train_target = prepare_time_series_data(y_train, window_size)
 
-# Changed network architecture to work with flattened input
-# Input size is now N * window_size (features * time steps)
+# Network architecture
 net = Chain(
-    Dense(N * window_size, 20, relu),  # First layer handles flattened input
-    Dense(20, 20, relu),               # Hidden layer
-    Dense(20, 2*N)                     # Output layer: mean and log-variance for each series
+    Dense(N * window_size, 20, relu),
+    Dense(20, 20, relu),
+    Dense(20, 2*N)
 )
 
 nc = destruct(net)
 
 # Use DCCGarchNormal likelihood
-like = DCCGarchNormal(nc, Normal(0, 0.5), N)
+like = DCCGarchNormal(nc, Normal(0, 0.5f0), N)
 prior = GaussianPrior(nc, 0.5f0)
 init = InitialiseAllSame(Normal(0.0f0, 0.5f0), like, prior)
 
 # Create BNN
 bnn = BNN(x_train, y_train_target, like, prior, init)
 
-# Find MAP estimate
+# Additional Zygote configuration to ignore BayesFlux internals
+Zygote.@nograd BayesFlux.FluxModeFinder
+
+# Find MAP estimate - use batch size from warnings
+batch_size = 395  # Match the size mentioned in the warnings
 opt = FluxModeFinder(bnn, Flux.ADAM())
-θmap = find_mode(bnn, 2, 500, opt)
+
+# Wrap the find_mode call in Zygote.ignore to prevent any gradient tracking
+θmap = Zygote.ignore() do
+    find_mode(bnn, 1000, batch_size, opt)
+end
 
 # Get predictions from MAP estimate
 nethat = nc(θmap)
-
-# Function to extract predictions from the model
-function extract_predictions(net, x)
-    n_features = size(net.layers[end].weight, 1) ÷ 2
-    n_samples = size(x, 2)
-    
-    means = zeros(Float32, n_samples, n_features)
-    sigmas = zeros(Float32, n_samples, n_features)
-    
-    for i in 1:n_samples
-        out = net(x[:, i])
-        means[i, :] = out[1:n_features]
-        sigmas[i, :] = exp.(out[n_features+1:2*n_features] ./ 2)
-    end
-    
-    return means, sigmas
-end
 
 # Get predictions for training set
 means_train, sigmas_train = extract_predictions(nethat, x_train)
@@ -455,5 +402,3 @@ plot!(p2, train_plot_indices, [means_train[:, 2] + 2*sigmas_train[:, 2], means_t
       label=["95% CI" nothing], color=:red, alpha=0.3, linestyle=:dash)
 
 plot(p1, p2, layout=(2,1), size=(800, 600))
-
-

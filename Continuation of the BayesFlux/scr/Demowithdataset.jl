@@ -539,3 +539,171 @@ println(correlation_matrix)
 # Plot the correlation matrix
 heatmap(correlation_matrix, title="Final Conditional Correlation Matrix", 
         xlabel="Assets", ylabel="Assets", color=:viridis, aspect_ratio=1)
+
+
+
+
+##########################
+
+# DCC-GARCH Bayesian Neural Network for ETF Returns
+using Flux, BayesFlux
+using Random, Distributions, LinearAlgebra, Plots
+using MCMCChains, Bijectors, Statistics
+using CSV, DataFrames
+
+Random.seed!(1212)
+
+# Load data
+etf_rf = "/Users/kevin/Documents/University of Maastricht /Master Econometrics and Operations Research/Master Thesis /MasterThesis/Continuation of the BayesFlux/scr/data/etfReturns.csv"
+df = CSV.read(etf_rf, DataFrame)
+
+etf_names = ["16383", "16386", "16388", "16397", "16403", "16412", "16414", "16418", 
+             "16421", "16423", "16424", "16426", "16433", "16437", "16452", "16460", 
+             "24697", "27635", "28272", "28273", "28274", "28275", "28276", "28277", 
+             "28278", "28279", "28280", "31372", "31466"]
+
+# Data preprocessing with mean imputation
+function preprocess_data(df, etf_names)
+    # Handle missing values by replacing with the mean of the column
+    for col in etf_names
+        if any(ismissing, df[!, col])
+            df[!, col] = coalesce.(df[!, col], mean(skipmissing(df[!, col])))
+        end
+    end
+    
+    etf_returns = Matrix{Float64}(df[!, etf_names])
+    rf_returns = Vector{Float64}(df[!, "rf"])
+    returns = hcat(etf_returns, rf_returns)
+    
+    # Calculate mean returns for each asset
+    μ = mean(returns, dims=1)
+    
+    return etf_returns, rf_returns, returns, vec(μ)
+end
+
+# Helper functions from the example code
+sigmoid(x) = 1/(1+exp(-x))
+transform_ab(a,b) = let a_=sigmoid(a); b_=sigmoid(b)*(1-a_); (a_,b_) end
+nearest_pd(A) = (A + A')/2 + 1e-4I  # Quick positive definite repair
+
+function prepare_time_series_data(data, w)
+    n = size(data,1) - w
+    p = size(data,2)
+    X = Array{Float32}(undef, p*w, n)
+    Y = Array{Float32}(undef, p,   n)
+    for i in 1:n
+        X[:,i] = reshape(data[i:i+w-1,:]', :)
+        Y[:,i] = data[i+w,:]
+    end
+    return X, Y
+end
+
+# DCC-GARCH likelihood function (same as in the example)
+struct DCCGarchNormal{T,F,D<:Distribution} <: BNNLikelihood
+    num_params_like::Int
+    nc::NetConstructor{T,F}
+    prior::D
+    N::Int
+end
+DCCGarchNormal(nc::NetConstructor{T,F}, prior::D, N::Int) where {T,F,D<:Distribution} =
+    DCCGarchNormal{T,F,D}(2, nc, prior, N)
+
+function (ℓ::DCCGarchNormal)(x::Matrix{T}, y::Matrix{T},
+                             θnet::AbstractVector, θlike::AbstractVector) where {T}
+
+    θnet, θlike = T.(θnet), T.(θlike)
+    a,b         = transform_ab(θlike...)
+    net         = ℓ.nc(θnet)
+    N, Tsteps   = ℓ.N, size(x,2)
+
+    outs  = map(t -> net(view(x,:,t)), 1:Tsteps)
+    μ     = hcat(map(o -> o[1:N]    , outs)...)
+    logσ2 = hcat(map(o -> o[N+1:2N] , outs)...)
+    σ     = exp.(logσ2 ./ 2)
+    z     = (y .- μ) ./ σ
+
+    Q̄ = Tsteps>1 ? (z*z')/Tsteps : Matrix{T}(I,N,N)
+    d  = 1 ./ sqrt.(diag(Q̄))
+    Q̄ = Symmetric(diagm(d)*Q̄*diagm(d))
+
+    Q, logl = Q̄, zero(T)
+    for t in 1:Tsteps
+        d = 1 ./ sqrt.(max.(diag(Q),1e-10))
+        R = Symmetric(diagm(d)*Q*diagm(d))
+        D = Diagonal(view(σ,:,t))
+        H = nearest_pd(D*R*D)
+        L = cholesky(Symmetric(H)).L
+
+        diff = view(y,:,t) .- view(μ,:,t)
+        quad = sum(abs2, L \ diff)
+        logl -= 0.5*(N*log(2π) + 2*sum(log,diag(L)) + quad)
+
+        if t < Tsteps
+            zt = view(z,:,t)
+            Q  = (1-a-b).*Q̄ .+ a.*(zt*zt') .+ b.*Q
+        end
+    end
+    logl += sum(logpdf.(ℓ.prior, vec(μ)))
+    return logl
+end
+
+# Main implementation
+
+# Step 1: Preprocess the ETF data
+etf_returns, rf_returns, returns, μ = preprocess_data(df, etf_names)
+
+# Step 2: Select a subset of ETFs for computational efficiency
+N = 5  # Use first 5 ETFs for demonstration (can be adjusted)
+selected_etfs = etf_returns[:, 1:N]
+
+# Step 3: Split data into training and testing sets
+total_samples = size(selected_etfs, 1)
+train_idx = 1:Int(round(0.8 * total_samples))
+test_idx = (train_idx[end] + 1):total_samples
+
+# Step 4: Prepare time series data with window size 5
+window = 5
+Xtr, Ytr = prepare_time_series_data(Float32.(selected_etfs[train_idx, :]), window)
+Xte, Yte = prepare_time_series_data(Float32.(selected_etfs[test_idx, :]), window)
+
+# Step 5: Build the neural network
+net = Chain(
+    Dense(N*window, 30, relu),
+    Dense(30, 30, relu),
+    Dense(30, 2N)  # Output: N means + N log variances
+)
+
+nc = destruct(net)
+like = DCCGarchNormal(nc, Normal(0, 0.5), N)
+prior = GaussianPrior(nc, 0.5f0)
+init = InitialiseAllSame(Normal(0f0, 0.5f0), like, prior)
+bnn = BNN(Xtr, Ytr, like, prior, init)
+
+# Step 6: Find the posterior mode
+println("Finding posterior mode...")
+θmap = find_mode(bnn, 50, 128, FluxModeFinder(bnn, Flux.ADAM()))
+println("Posterior mode found.")
+
+# Step 7: Posterior sampling with SGLD
+println("Starting SGLD sampling...")
+sgld = SGLD(Float32;
+            stepsize_a = 5f-4,  # Smaller stepsize for stability
+            stepsize_b = 0f0,
+            stepsize_γ = 0.55f0)
+
+draws = mcmc(bnn, 128, 10_000, sgld)
+draws = draws[:, 5_001:end]  # Discard first 5000 as burn-in
+
+# Step 8: Remove any draws containing NaN or Inf values
+good = map(i -> all(isfinite, view(draws, :, i)), axes(draws, 2))
+draws = draws[:, good]
+samples = [draws[:, i] for i in axes(draws, 2)]
+
+println("SGLD sampling completed. Number of valid samples: $(length(samples))")
+
+# Step 9: Diagnostics
+param_names = ["θ_$i" for i in 1:size(draws, 1)]
+chn = Chains(permutedims(draws, (2, 1)), param_names)
+println(summarystats(chn))
+
+

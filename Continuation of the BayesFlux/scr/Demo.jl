@@ -999,7 +999,7 @@ prior = GaussianPrior(nc, 0.5f0)
 init  = InitialiseAllSame(Normal(0f0,0.5f0), like, prior)
 bnn   = BNN(Xtr, Ytr, like, prior, init)
 
-θmap = find_mode(bnn, 1000, 395, FluxModeFinder(bnn, Flux.ADAM()))
+θmap = find_mode(bnn, 50, 500, FluxModeFinder(bnn, Flux.ADAM()))
 
 # ─────────────────────── 6.  posterior sampling (SGLD) ──────────────────────
 sgld = SGLD(Float32;               # \gamma<Tab> for the Unicode letter

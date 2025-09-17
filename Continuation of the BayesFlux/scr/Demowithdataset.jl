@@ -661,8 +661,8 @@ total_samples = size(selected_etfs, 1)
 train_idx = 1:Int(round(0.8 * total_samples))
 test_idx = (train_idx[end] + 1):total_samples
 
-# Step 4: Prepare time series data with window size 5
-window = 5
+# Step 4: Prepare time series data with window size 22
+window = 22
 Xtr, Ytr = prepare_time_series_data(Float32.(selected_etfs[train_idx, :]), window)
 Xte, Yte = prepare_time_series_data(Float32.(selected_etfs[test_idx, :]), window)
 
@@ -681,8 +681,10 @@ bnn = BNN(Xtr, Ytr, like, prior, init)
 
 # Step 6: Find the posterior mode
 println("Finding posterior mode...")
-θmap = find_mode(bnn, 50, 128, FluxModeFinder(bnn, Flux.ADAM()))
+θmap = find_mode(bnn, 50, 500, FluxModeFinder(bnn, Flux.ADAM()))
 println("Posterior mode found.")
+
+
 
 # Step 7: Posterior sampling with SGLD
 println("Starting SGLD sampling...")

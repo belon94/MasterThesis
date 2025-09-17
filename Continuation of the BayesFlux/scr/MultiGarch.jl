@@ -483,31 +483,20 @@ function t_dcc_garch(returns)
     )
 end
 
-# Modified analysis function to include degrees of freedom
-function analyse_t_results(t_dcc_results, etf_names, returns)
-    n, N = size(returns)
-    
-    println("\nGARCH(1,1) with t-distribution Parameters for each asset:")
-    for (i, etf) in enumerate(etf_names)
-        ω, α, β, df = t_dcc_results["garch_params"][i]
-        println("ETF $etf: ω = $ω, α = $α, β = $β, df = $df")
-    end
-    
-    a, b = t_dcc_results["dcc_params"]
-    println("\nDCC Parameters:")
-    println("a = $a")
-    println("b = $b")
-    
-    println("\nAverage correlations with risk-free rate:")
-    for (i, etf) in enumerate(etf_names)
-        avg_corr = mean(t_dcc_results["correlations"][:, i, end])
-        println("ETF $etf: $avg_corr")
-    end
-    
-    println("\nAverage degrees of freedom: ", mean(t_dcc_results["degrees_of_freedom"]))
-    println("Min degrees of freedom: ", minimum(t_dcc_results["degrees_of_freedom"]))
-    println("Max degrees of freedom: ", maximum(t_dcc_results["degrees_of_freedom"]))
-end
+# Run the analysis with comprehensive timing
+println("🎯 Launching DCC-GARCH analysis at $(Dates.now())")
+results = run_dcc_analysis_with_proper_windows(returns, train_index, val_index, test_index, rolling_window_size)
+
+
+test_dcc_a = [params[1] for params in results["test_params"]["dcc"]]
+test_dcc_b = [params[2] for params in results["test_params"]["dcc"]]
+
+println("\n📈 DCC Parameter Evolution in Test Period:")
+println("a parameter - Mean: $(round(mean(test_dcc_a), digits=4)), Std: $(round(std(test_dcc_a), digits=4))")
+println("b parameter - Mean: $(round(mean(test_dcc_b), digits=4)), Std: $(round(std(test_dcc_b), digits=4))")
+println("Persistence (a+b) - Mean: $(round(mean(test_dcc_a .+ test_dcc_b), digits=4)), Std: $(round(std(test_dcc_a .+ test_dcc_b), digits=4))")
+
+
 
 # Fit t-distribution model
 println("Starting DCC-GARCH with t-distribution estimation...")

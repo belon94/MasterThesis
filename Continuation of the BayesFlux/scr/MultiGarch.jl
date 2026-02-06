@@ -7,8 +7,9 @@
 
 using BayesFlux, Flux
 using Random, Distributions
-using StatsPlots, Optim, 
-using ARCHModels, LinearAlgebra, DataFrames, CSV, Plots, Statistics
+using StatsPlots, Optim
+using ARCHModels
+using LinearAlgebra, DataFrames, CSV, Plots, Statistics
 using MCMCChains, Bijectors
 using SpecialFunctions
 
@@ -127,7 +128,7 @@ plot!(sqrt.(simulated_DCC_GARCH["sigma_squared"][1:end-1, N]),
 ### 29 ETF and 1 risk-free asset, so 30 variables with 4280 observations
 
 # Load data
-eft_rf = "/Users/kevin/Documents/University of Maastricht /Master Econometrics and Operations Research/Master Thesis /MasterThesis/Continuation of the BayesFlux/data/etfReturns.csv"
+eft_rf = "/Users/kevin/Documents/University of Maastricht /Master Econometrics and Operations Research/Master Thesis /MasterThesis/Continuation of the BayesFlux/scr/data/etfReturns.csv"
 df = CSV.read(eft_rf, DataFrame)
 
 etf_names = ["16383", "16386", "16388", "16397", "16403", "16412", "16414", "16418", 
@@ -321,184 +322,328 @@ dcc_results = dcc_garch(returns)
 
 analyse_results(dcc_results, etf_names, returns)
 
-#### Now also I will compute the DCC-GARCH model with t-distribution
+#############################
 
-# GARCH(1,1) with t-distribution likelihood for parameter estimation
-function t_garch_likelihood(params, returns)
-    ω, α, β, df = params  # Added degrees of freedom parameter
-    n = length(returns)
-    σ² = zeros(n)
-    σ²[1] = var(returns)
-    loglik = 0.0
-    
-    # Constants for t-distribution
-    logconst = loggamma((df + 1)/2) - loggamma(df/2) - 0.5*log(π*df)
-    
-    for t in 2:n
-        σ²[t] = max(ω + α * returns[t-1]^2 + β * σ²[t-1], 1e-6)
-        # t-distribution log-likelihood
-        loglik += logconst - 0.5*log(σ²[t]) - 
-                 ((df + 1)/2) * log(1 + (returns[t]^2)/(σ²[t]*df))
-    end
-    
-    return -loglik
+###############################################################################
+#  Traditional DCC-GARCH Model - Multiple Assets
+###############################################################################
+using Random, Distributions, LinearAlgebra, Plots
+using CSV, DataFrames, Statistics, Optim
+using MCMCChains  # For diagnostics only
+
+Random.seed!(1212)
+
+# ───────────────────────── 1. Helper Functions ──────────────────────────────
+sigmoid(x) = 1/(1+exp(-x))
+transform_garch_params(params) = abs.(params) .+ 1e-6  # Ensure positivity
+transform_dcc_params(a, b) = let a_=sigmoid(a); b_=sigmoid(b)*(1-a_); (a_, b_) end
+nearest_pd(A) = (A + A')/2 + 1e-6I
+
+# ───────────────────────── 2. Traditional DCC-GARCH Model ──────────────────────────
+struct DCCGARCHModel
+    N::Int          # Number of assets
+    data::Matrix{Float64}  # Returns data (T x N)
+    T::Int          # Number of observations
 end
 
-# Estimate GARCH parameters with t-distribution
-function estimate_t_garch_params(returns)
-    initial_params = [var(returns)*0.01, 0.1, 0.8, 5.0]  # Initial df = 5
-    
-    function obj(params)
-        ω, α, β, df = params
-        if ω ≤ 0 || α < 0 || β < 0 || α + β ≥ 1 || df <= 2  # df > 2 for finite variance
-            return Inf
-        end
-        return t_garch_likelihood(params, returns)
-    end
-    
-    result = optimize(obj, initial_params, BFGS())
-    return Optim.minimizer(result)
+function DCCGARCHModel(data::Matrix{Float64})
+    T, N = size(data)
+    return DCCGARCHModel(N, data, T)
 end
 
-# Fit univariate GARCH(1,1) with t-distribution
-function fit_univariate_t_garch(returns)
-    n = length(returns)
-    ω, α, β, df = estimate_t_garch_params(returns)
-    σ² = zeros(n + 1)
-    σ²[1] = var(returns)
+# GARCH(1,1) volatility for single asset
+function garch11_volatility(returns::Vector{Float64}, ω::Float64, α::Float64, β::Float64)
+    T = length(returns)
+    σ² = zeros(T)
+    σ²[1] = var(returns)  # Initial variance
     
-    for t in 2:n
+    for t in 2:T
         σ²[t] = ω + α * returns[t-1]^2 + β * σ²[t-1]
     end
     
-    σ²[n+1] = ω + α * returns[n]^2 + β * σ²[n]
-    return σ², (ω, α, β, df)
+    return sqrt.(σ²)
 end
 
-# Modified DCC likelihood with t-distribution
-function t_dcc_likelihood(params, std_returns, Q_bar, df_vector)
-    a, b = params
-    T, N = size(std_returns)
-    Qt = similar(Q_bar)
-    Qt .= Q_bar
+# DCC log-likelihood function
+function dcc_loglikelihood(params::Vector{Float64}, model::DCCGARCHModel)
+    N, data, T = model.N, model.data, model.T
+    
+    # Parameter extraction
+    param_idx = 1
+    
+    # GARCH parameters for each asset (ω, α, β for each)
+    garch_params = reshape(params[param_idx:param_idx+3*N-1], 3, N)
+    param_idx += 3*N
+    
+    # DCC parameters (a, b)
+    dcc_a_raw, dcc_b_raw = params[param_idx], params[param_idx+1]
+    dcc_a, dcc_b = transform_dcc_params(dcc_a_raw, dcc_b_raw)
+    
+    # Ensure GARCH parameters are positive and stationary
+    ω = transform_garch_params(garch_params[1, :])
+    α = transform_garch_params(garch_params[2, :])
+    β = transform_garch_params(garch_params[3, :])
+    
+    # Check stationarity condition
+    if any(α .+ β .>= 0.99)
+        return -Inf
+    end
+    
+    # Step 1: Estimate individual GARCH volatilities
+    σ = zeros(T, N)
+    for i in 1:N
+        σ[:, i] = garch11_volatility(data[:, i], ω[i], α[i], β[i])
+    end
+    
+    # Step 2: Compute standardized residuals
+    z = data ./ σ
+    
+    # Step 3: DCC estimation
+    # Unconditional correlation matrix
+    Q̄ = cor(z)
+    Q̄ = nearest_pd(Q̄)  # Ensure positive definite
+    
+    # Initialize Q
+    Q = copy(Q̄)
+    
     loglik = 0.0
     
-    # Use average df for simplicity
-    avg_df = mean(df_vector)
-    
-    for t in 2:T
-        Qt = (1 - a - b) * Q_bar + 
-             a * (std_returns[t-1,:] * std_returns[t-1,:]') + 
-             b * Qt
+    for t in 1:T
+        # Current correlation matrix
+        Q_diag_inv_sqrt = diagm(1 ./ sqrt.(max.(diag(Q), 1e-10)))
+        R = Q_diag_inv_sqrt * Q * Q_diag_inv_sqrt
+        R = nearest_pd(R)
         
-        # Ensure positive definiteness
-        Qt = (Qt + Qt') / 2
+        # Current covariance matrix
+        D = diagm(σ[t, :])
+        H = D * R * D
+        H = nearest_pd(H)
         
-        Qt_diag = Diagonal(sqrt.(diag(Qt)))
-        Rt = inv(Qt_diag) * Qt * inv(Qt_diag)
-        
-        # Multivariate t-distribution log-likelihood component
-        v = std_returns[t,:]' * inv(Rt) * std_returns[t,:]
-        
-        loglik += loggamma((avg_df + N)/2) - loggamma(avg_df/2) - (N/2)*log(π*avg_df) -
-                 0.5*log(det(Rt)) - ((avg_df + N)/2)*log(1 + v/avg_df)
-    end
-    
-    return -loglik
-end
-
-# Estimate DCC parameters with t-distribution
-function estimate_t_dcc_params(std_returns, df_vector)
-    Q_bar = cor(std_returns)
-    
-    function obj(params)
-        a, b = params
-        if a < 0 || b < 0 || (a + b) ≥ 1
-            return Inf
+        try
+            # Log-likelihood contribution
+            L = cholesky(H).L
+            diff = data[t, :]
+            quad = sum(abs2, L \ diff)
+            loglik += -0.5 * (N * log(2π) + 2 * sum(log, diag(L)) + quad)
+        catch
+            return -Inf
         end
-        return t_dcc_likelihood(params, std_returns, Q_bar, df_vector)
+        
+        # Update Q for next period
+        if t < T
+            z_t = z[t, :]
+            Q = (1 - dcc_a - dcc_b) * Q̄ + dcc_a * (z_t * z_t') + dcc_b * Q
+        end
     end
     
-    initial_params = [0.01, 0.97]
-    result = optimize(obj, initial_params, BFGS())
-    return Optim.minimizer(result)
+    return loglik
 end
 
-# Main DCC-GARCH function with t-distribution
-function t_dcc_garch(returns)
-    n, N = size(returns)
+# ───────────────────────── 3. Estimation Function ──────────────────────────
+function estimate_dcc_garch(model::DCCGARCHModel; maxiter=1000)
+    N = model.N
     
-    # First stage: Fit univariate t-GARCH models
-    volatilities = zeros(n + 1, N)
-    std_returns = zeros(n, N)
-    t_garch_params = Vector{Tuple{Float64, Float64, Float64, Float64}}(undef, N)
+    # Initial parameter values
+    # GARCH parameters: ω, α, β for each asset
+    initial_garch = vcat([0.01, 0.05, 0.9] for _ in 1:N...)
     
-    println("Fitting univariate t-GARCH models...")
+    # DCC parameters: a, b (in raw form for transformation)
+    initial_dcc = [0.01, 0.95]
+    
+    initial_params = vcat(initial_garch, initial_dcc)
+    
+    println("Starting DCC-GARCH estimation...")
+    println("Number of parameters: $(length(initial_params))")
+    println("GARCH parameters per asset: 3 (ω, α, β)")
+    println("DCC parameters: 2 (a, b)")
+    
+    # Objective function (negative log-likelihood)
+    objective(params) = -dcc_loglikelihood(params, model)
+    
+    # Optimization
+    result = optimize(objective, initial_params, 
+                     LBFGS(), 
+                     Optim.Options(iterations=maxiter, show_trace=true))
+    
+    if Optim.converged(result)
+        println("✓ Estimation converged successfully")
+    else
+        println("⚠ Estimation did not converge")
+    end
+    
+    return result
+end
+
+# ───────────────────────── 4. Results Analysis ──────────────────────────────
+function analyze_results(result, model::DCCGARCHModel)
+    N = model.N
+    params = Optim.minimizer(result)
+    
+    # Extract parameters
+    garch_params = reshape(params[1:3*N], 3, N)
+    dcc_params_raw = params[3*N+1:end]
+    
+    # Transform parameters
+    ω = transform_garch_params(garch_params[1, :])
+    α = transform_garch_params(garch_params[2, :])
+    β = transform_garch_params(garch_params[3, :])
+    dcc_a, dcc_b = transform_dcc_params(dcc_params_raw...)
+    
+    println("\n" * "="^60)
+    println("DCC-GARCH ESTIMATION RESULTS")
+    println("="^60)
+    println("Log-likelihood: $(round(-Optim.minimum(result), digits=4))")
+    println("Number of observations: $(model.T)")
+    println("Number of assets: $(model.N)")
+    
+    println("\nGARCH(1,1) Parameters:")
     for i in 1:N
-        println("Processing asset $i of $N")
-        volatilities[:, i], t_garch_params[i] = fit_univariate_t_garch(returns[:, i])
-        std_returns[:, i] = returns[:, i] ./ sqrt.(volatilities[1:end-1, i])
+        println("Asset $i:")
+        println("  ω = $(round(ω[i], digits=6))")
+        println("  α = $(round(α[i], digits=6))")  
+        println("  β = $(round(β[i], digits=6))")
+        println("  α + β = $(round(α[i] + β[i], digits=6))")
     end
     
-    # Extract degrees of freedom from each univariate model
-    df_vector = [params[4] for params in t_garch_params]
-    
-    # Second stage: DCC estimation with t-distribution
-    println("Estimating DCC parameters...")
-    a, b = estimate_t_dcc_params(std_returns, df_vector)
-    
-    # Compute time-varying matrices
-    Q_bar = cor(returns)
-    Q_t = zeros(n, N, N)
-    R_t = zeros(n, N, N)
-    H_t = zeros(n, N, N)
-    Q_t[1, :, :] = Q_bar
-    
-    println("Computing time-varying matrices...")
-    for t in 2:n
-        Q_t[t, :, :] = (1 - a - b) * Q_bar + 
-                       a * (std_returns[t-1, :] * std_returns[t-1, :]') + 
-                       b * Q_t[t-1, :, :]
-        
-        # Ensure positive definiteness
-        Q_t[t, :, :] = (Q_t[t, :, :] + Q_t[t, :, :]') / 2
-        
-        # Compute correlation matrix
-        Q_diag = Diagonal(sqrt.(diag(Q_t[t, :, :])))
-        R_t[t, :, :] = inv(Q_diag) * Q_t[t, :, :] * inv(Q_diag)
-        
-        # Compute conditional covariance matrix
-        D_t = Diagonal(sqrt.(volatilities[t, :]))
-        H_t[t, :, :] = D_t * R_t[t, :, :] * D_t
-    end
+    println("\nDCC Parameters:")
+    println("  a = $(round(dcc_a, digits=6))")
+    println("  b = $(round(dcc_b, digits=6))")
+    println("  a + b = $(round(dcc_a + dcc_b, digits=6))")
     
     return Dict(
-        "correlations" => R_t,
-        "volatilities" => volatilities,
-        "std_returns" => std_returns,
-        "garch_params" => t_garch_params,
-        "dcc_params" => (a, b),
-        "conditional_cov" => H_t,
-        "degrees_of_freedom" => df_vector
+        "omega" => ω,
+        "alpha" => α, 
+        "beta" => β,
+        "dcc_a" => dcc_a,
+        "dcc_b" => dcc_b,
+        "loglik" => -Optim.minimum(result)
     )
 end
 
-# Run the analysis with comprehensive timing
-println("🎯 Launching DCC-GARCH analysis at $(Dates.now())")
-results = run_dcc_analysis_with_proper_windows(returns, train_index, val_index, test_index, rolling_window_size)
+# ───────────────────────── 5. Forecasting Function ──────────────────────────
+function forecast_volatility_correlation(model::DCCGARCHModel, params_dict, h::Int=1)
+    N, data, T = model.N, model.data, model.T
+    ω, α, β = params_dict["omega"], params_dict["alpha"], params_dict["beta"]
+    dcc_a, dcc_b = params_dict["dcc_a"], params_dict["dcc_b"]
+    
+    # Compute final period volatilities and correlations
+    σ = zeros(T, N)
+    for i in 1:N
+        σ[:, i] = garch11_volatility(data[:, i], ω[i], α[i], β[i])
+    end
+    
+    z = data ./ σ
+    Q̄ = cor(z)
+    Q̄ = nearest_pd(Q̄)
+    
+    # Get final Q matrix
+    Q = copy(Q̄)
+    for t in 1:T-1
+        z_t = z[t, :]
+        Q = (1 - dcc_a - dcc_b) * Q̄ + dcc_a * (z_t * z_t') + dcc_b * Q
+    end
+    
+    # Forecast volatilities (h-step ahead)
+    σ_forecast = zeros(N)
+    for i in 1:N
+        σ²_T = σ[T, i]^2
+        unconditional_var = ω[i] / (1 - α[i] - β[i])
+        σ²_forecast = unconditional_var + (α[i] + β[i])^h * (σ²_T - unconditional_var)
+        σ_forecast[i] = sqrt(σ²_forecast)
+    end
+    
+    # Forecast correlations (mean revert to unconditional)
+    Q_forecast = Q̄ + (dcc_a + dcc_b)^h * (Q - Q̄)
+    Q_diag_inv_sqrt = diagm(1 ./ sqrt.(diag(Q_forecast)))
+    R_forecast = Q_diag_inv_sqrt * Q_forecast * Q_diag_inv_sqrt
+    
+    return σ_forecast, R_forecast
+end
 
+# ───────────────────────── 6. Data Loading and Main Analysis ────────────────────────
 
-test_dcc_a = [params[1] for params in results["test_params"]["dcc"]]
-test_dcc_b = [params[2] for params in results["test_params"]["dcc"]]
+# Load and preprocess data function
+function load_and_preprocess_data(file_path::String, selected_assets::Vector{String})
+    df = CSV.read(file_path, DataFrame)
+    
+    # Handle missing values
+    for col in selected_assets
+        if any(ismissing, df[!, col])
+            df[!, col] = coalesce.(df[!, col], mean(skipmissing(df[!, col])))
+        end
+    end
+    
+    returns = Matrix{Float64}(df[!, selected_assets])
+    μ = mean(returns, dims=1)
+    
+    return returns, vec(μ)
+end
 
-println("\n📈 DCC Parameter Evolution in Test Period:")
-println("a parameter - Mean: $(round(mean(test_dcc_a), digits=4)), Std: $(round(std(test_dcc_a), digits=4))")
-println("b parameter - Mean: $(round(mean(test_dcc_b), digits=4)), Std: $(round(std(test_dcc_b), digits=4))")
-println("Persistence (a+b) - Mean: $(round(mean(test_dcc_a .+ test_dcc_b), digits=4)), Std: $(round(std(test_dcc_a .+ test_dcc_b), digits=4))")
+# Main analysis function
+function run_dcc_garch_analysis(n_assets::Int)
+    println("\n" * "="^60)
+    println("TRADITIONAL DCC-GARCH ANALYSIS - $n_assets ASSETS")
+    println("="^60)
+    
+    # Load data
+    etf_rf = "/Users/kevin/Documents/University of Maastricht /Master Econometrics and Operations Research/Master Thesis /MasterThesis/Continuation of the BayesFlux/scr/data/etfReturns.csv"  # Adjust path as needed
+    etf_names = ["16383", "16386", "16388", "16397", "16403", "16412", "16414", "16418", 
+                 "16421", "16423", "16424", "16426", "16433", "16437", "16452", "16460", 
+                 "24697", "27635", "28272", "28273", "28274", "28275", "28276", "28277", 
+                 "28278", "28279", "28280", "31372", "31466"]
+    
+    selected_assets = etf_names[1:n_assets]
+    
+    try
+        returns, μ_returns = load_and_preprocess_data(etf_rf, selected_assets)
+        
+        println("Selected assets: $selected_assets")
+        println("Data dimensions: $(size(returns, 1)) observations, $n_assets assets")
+        println("Average returns: $(round.(μ_returns, digits=6))")
+        
+        # Create model
+        model = DCCGARCHModel(returns)
+        
+        # Estimate model
+        result = estimate_dcc_garch(model)
+        
+        # Analyze results
+        params_dict = analyze_results(result, model)
+        
+        # Generate forecasts
+        println("\nGenerating 1-step ahead forecasts...")
+        σ_forecast, R_forecast = forecast_volatility_correlation(model, params_dict, 1)
+        
+        println("\nForecasted Volatilities:")
+        for i in 1:n_assets
+            println("Asset $i: $(round(σ_forecast[i], digits=6))")
+        end
+        
+        println("\nForecasted Correlation Matrix:")
+        display(round.(R_forecast, digits=4))
+        
+        return model, result, params_dict
+        
+    catch e
+        println("Error loading data: $e")
+        println("Please ensure the data file path is correct")
+        return nothing, nothing, nothing
+    end
+end
 
+# ───────────────────────── 7. Run Analysis for Different Asset Counts ──────────────────────
 
+# Run analysis for different numbers of assets
+for n_assets in [2, 5, 10,30]
+    model, result, params = run_dcc_garch_analysis(n_assets)
+    
+    if model !== nothing
+        println("\n✓ $n_assets-asset analysis completed successfully")
+    else
+        println("\n✗ $n_assets-asset analysis failed")
+    end
+    
+    println("\n" * "-"^60)
+end
 
-# Fit t-distribution model
-println("Starting DCC-GARCH with t-distribution estimation...")
-t_dcc_results = t_dcc_garch(returns)
-analyse_t_results(t_dcc_results, etf_names, returns)
+println("\nTraditional DCC-GARCH Analysis Complete!")

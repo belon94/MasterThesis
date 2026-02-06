@@ -1,339 +1,24 @@
-## Try to compute the DCC-GARCH(1,1) model with the following steps without taking into account the fat-tailed distribution.
-### DCC-GARCH(1,1) model implementation with real data
-### 29 ETF and 1 risk-free asset, so 30 variables with 4280 observations
+###############################################################################
+#   Multi-Asset DCC-GARCH Analysis for Different Portfolio Sizes
+#   Comparing performance across 2, 5, 10, and 30 assets
+###############################################################################
 
-using CSV
-using DataFrames
-using Statistics
-using LinearAlgebra
-using Optim
+using Optim, LinearAlgebra, Statistics, Distributions
+using CSV, DataFrames, Plots
+using ForwardDiff, Random, Printf
 
-# Load data
-etf_rf = "/Users/kevin/Documents/University of Maastricht /Master Econometrics and Operations Research/Master Thesis /MasterThesis/Continuation of the BayesFlux/data/etfReturns.csv"
-df = CSV.read(etf_rf, DataFrame)
+Random.seed!(123)
 
-etf_names = ["16383", "16386", "16388", "16397", "16403", "16412", "16414", "16418", 
-             "16421", "16423", "16424", "16426", "16433", "16437", "16452", "16460", 
-             "24697", "27635", "28272", "28273", "28274", "28275", "28276", "28277", 
-             "28278", "28279", "28280", "31372", "31466"]
-
-# Data preprocessing - keeping mean imputation as requested
-function preprocess_data(df, etf_names)
-    # Handle missing values by replacing with the mean of the column
-    for col in etf_names
-        if any(ismissing, df[!, col])
-            df[!, col] = coalesce.(df[!, col], mean(skipmissing(df[!, col])))
-        end
-    end
-    
-    etf_returns = Matrix{Float64}(df[!, etf_names])
-    rf_returns = Vector{Float64}(df[!, "rf"])
-    returns = hcat(etf_returns, rf_returns)
-    
-    # Calculate mean returns for each asset
-    μ = mean(returns, dims=1)
-    
-    return etf_returns, rf_returns, returns, vec(μ)
-end
-
-# GARCH(1,1) likelihood for parameter estimation
-function garch_likelihood(params, returns, μ_i)
-    ω, α, β = params
-    n = length(returns)
-    σ² = zeros(n)
-    
-    # Initialize with sample variance
-    σ²[1] = var(returns .- μ_i)
-    loglik = 0.0
-    
-    for t in 2:n
-        # Use squared deviation from mean (r_t - μ)²
-        ε²_t_1 = (returns[t-1] - μ_i)^2
-        σ²[t] = max(ω + α * ε²_t_1 + β * σ²[t-1], 1e-8)
-        loglik += -0.5 * (log(2π) + log(σ²[t]) + (returns[t] - μ_i)^2/σ²[t])
-    end
-    
-    return -loglik
-end
-
-# Estimate GARCH parameters
-function estimate_garch_params(returns, μ_i)
-    # Initial parameters [ω, α, β]
-    initial_params = [var(returns .- μ_i)*0.01, 0.1, 0.8]
-    
-    function obj(params)
-        ω, α, β = params
-        if ω ≤ 0 || α < 0 || β < 0 || α + β ≥ 1
-            return Inf
-        end
-        return garch_likelihood(params, returns, μ_i)
-    end
-    
-    result = optimize(obj, initial_params, BFGS())
-    return Optim.minimizer(result)
-end
-
-# Fit univariate GARCH(1,1) and compute standardized residuals
-function fit_univariate_garch(returns, μ_i)
-    n = length(returns)
-    ω, α, β = estimate_garch_params(returns, μ_i)
-    
-    # Conditional variance
-    σ² = zeros(n)
-    σ²[1] = var(returns .- μ_i)
-    
-    # Standardized residuals
-    ε = returns .- μ_i
-    ν = zeros(n)
-    ν[1] = ε[1] / sqrt(σ²[1])
-    
-    for t in 2:n
-        σ²[t] = ω + α * ε[t-1]^2 + β * σ²[t-1]
-        ν[t] = ε[t] / sqrt(σ²[t])
-    end
-    
-    # Forecast one step ahead variance
-    σ²_next = ω + α * ε[n]^2 + β * σ²[n]
-    
-    return σ², ν, (ω, α, β), σ²_next
-end
-
-# Calculate R_bar (Bollerslev's CCC estimator)
-function calculate_R_bar(standardized_residuals)
-    T, n = size(standardized_residuals)
-    R_bar = zeros(n, n)
-    
-    # R_bar = (1/T) * sum(ν_t * ν_t')
-    for t in 1:T
-        R_bar .+= standardized_residuals[t, :] * standardized_residuals[t, :]'
-    end
-    R_bar ./= T
-    
-    # Ensure R_bar is a correlation matrix
-    D_inv = Diagonal(1.0 ./ sqrt.(diag(R_bar)))
-    R_bar = D_inv * R_bar * D_inv
-    
-    return R_bar
-end
-
-# DCC likelihood for parameter estimation
-function dcc_likelihood(params, standardized_residuals, R_bar)
-    a, b = params
-    T, n = size(standardized_residuals)
-    
-    # Initialize Q_t with unconditional correlation R_bar
-    Q_prev = copy(R_bar)
-    loglik = 0.0
-    
-    for t in 2:T
-        # Calculate Q_t according to the DCC equation
-        ν_prod = standardized_residuals[t-1, :] * standardized_residuals[t-1, :]'
-        Q_t = R_bar * (1 - a - b) + a * ν_prod + b * Q_prev
-        
-        # Ensure Q_t is symmetric
-        Q_t = (Q_t + Q_t') / 2
-        
-        # Compute correlation matrix from Q_t
-        Q_diag_inv = Diagonal(1.0 ./ sqrt.(diag(Q_t)))
-        R_t = Q_diag_inv * Q_t * Q_diag_inv
-        
-        # Add to log-likelihood (only correlation part)
-        det_R = max(det(R_t), 1e-10)  # Ensure positive determinant
-        ν_t = standardized_residuals[t, :]
-        loglik += -0.5 * (log(det_R) + ν_t' * inv(R_t) * ν_t - ν_t' * ν_t)
-        
-        Q_prev = Q_t
-    end
-    
-    return -loglik
-end
-
-# Estimate DCC parameters
-function estimate_dcc_params(standardized_residuals, R_bar)
-    function obj(params)
-        a, b = params
-        if a < 0 || b < 0 || a + b >= 1
-            return Inf
-        end
-        return dcc_likelihood(params, standardized_residuals, R_bar)
-    end
-    
-    initial_params = [0.01, 0.97]  # Common starting values for financial returns
-    result = optimize(obj, initial_params, BFGS())
-    return Optim.minimizer(result)
-end
-
-# Main DCC-GARCH function
-function dcc_garch(returns, μ)
-    T, n = size(returns)
-    
-    # First stage: Fit univariate GARCH models for each series
-    σ² = zeros(T, n)
-    σ²_next = zeros(n)
-    ν = zeros(T, n)
-    garch_params = Vector{Tuple{Float64, Float64, Float64}}(undef, n)
-    
-    for i in 1:n
-        σ²[:, i], ν[:, i], garch_params[i], σ²_next[i] = fit_univariate_garch(returns[:, i], μ[i])
-    end
-    
-    # Calculate R_bar based on standardized residuals
-    R_bar = calculate_R_bar(ν)
-    
-    # Second stage: Estimate DCC parameters
-    a, b = estimate_dcc_params(ν, R_bar)
-    
-    # Calculate dynamic correlation matrices
-    Q = zeros(T, n, n)
-    Q[1, :, :] = R_bar
-    R = zeros(T, n, n)
-    R[1, :, :] = R_bar
-    H = zeros(T, n, n)
-    
-    # Initialize first conditional covariance matrix
-    D_1 = Diagonal(sqrt.(σ²[1, :]))
-    H[1, :, :] = D_1 * R[1, :, :] * D_1
-    
-    for t in 2:T
-        # Update Q matrix according to DCC equation
-        ν_prod = ν[t-1, :] * ν[t-1, :]'
-        Q[t, :, :] = (1 - a - b) * R_bar + a * ν_prod + b * Q[t-1, :, :]
-        
-        # Ensure symmetry and positive definiteness
-        Q[t, :, :] = (Q[t, :, :] + Q[t, :, :]') / 2
-        
-        # If Q is not positive definite, apply nearest PD correction
-        eigvals_Q = eigvals(Q[t, :, :])
-        if minimum(eigvals_Q) <= 0
-            # Simple correction: add small constant to diagonal
-            Q[t, :, :] += Diagonal(1e-4 * ones(n))
-        end
-        
-        # Compute correlation matrix R from Q
-        Q_diag_inv = Diagonal(1.0 ./ sqrt.(diag(Q[t, :, :])))
-        R[t, :, :] = Q_diag_inv * Q[t, :, :] * Q_diag_inv
-        
-        # Compute conditional covariance matrix
-        D_t = Diagonal(sqrt.(σ²[t, :]))
-        H[t, :, :] = D_t * R[t, :, :] * D_t
-    end
-    
-    # Calculate one-step-ahead correlation and covariance matrices
-    Q_next = (1 - a - b) * R_bar + a * (ν[T, :] * ν[T, :]') + b * Q[T, :, :]
-    Q_next = (Q_next + Q_next') / 2
-    
-    # Ensure positive definiteness of next-step Q
-    eigvals_Q = eigvals(Q_next)
-    if minimum(eigvals_Q) <= 0
-        Q_next += Diagonal(1e-4 * ones(n))
-    end
-    
-    Q_diag_inv = Diagonal(1.0 ./ sqrt.(diag(Q_next)))
-    R_next = Q_diag_inv * Q_next * Q_diag_inv
-    
-    D_next = Diagonal(sqrt.(σ²_next))
-    H_next = D_next * R_next * D_next
-    
-    return Dict(
-        "correlations" => R,
-        "next_correlation" => R_next,
-        "volatilities" => σ²,
-        "next_volatility" => σ²_next,
-        "standardized_residuals" => ν,
-        "garch_params" => garch_params,
-        "dcc_params" => (a, b),
-        "conditional_cov" => H,
-        "next_cov" => H_next,
-        "R_bar" => R_bar
-    )
-end
-
-# Analysis function
-function analyse_results(dcc_results, etf_names, returns, μ)
-    n = length(etf_names) + 1  # Including risk-free
-    
-    println("\nMean returns:")
-    for (i, etf) in enumerate(etf_names)
-        println("ETF $etf: $(μ[i])")
-    end
-    println("Risk-free: $(μ[end])")
-    
-    println("\nGARCH(1,1) Parameters for each asset:")
-    for (i, etf) in enumerate([etf_names; "rf"])
-        ω, α, β = dcc_results["garch_params"][i]
-        persistence = α + β
-        uncond_var = ω / (1 - persistence)
-        println("Asset $etf: ω = $(round(ω, digits=6)), α = $(round(α, digits=4)), " *
-                "β = $(round(β, digits=4)), persistence = $(round(persistence, digits=4)), " *
-                "unconditional variance = $(round(uncond_var, digits=6))")
-    end
-    
-    a, b = dcc_results["dcc_params"]
-    println("\nDCC Parameters:")
-    println("a = $(round(a, digits=4))")
-    println("b = $(round(b, digits=4))")
-    println("Persistence (a + b) = $(round(a + b, digits=4))")
-    
-    println("\nUnconditional correlation matrix (R_bar):")
-    R_bar = dcc_results["R_bar"]
-    println("Average absolute correlation: $(round(mean(abs.(R_bar - Diagonal(diag(R_bar)))), digits=4))")
-    
-    T = size(returns, 1)
-    println("\nFinal day correlations with risk-free rate:")
-    for (i, etf) in enumerate(etf_names)
-        corr = dcc_results["correlations"][T, i, end]
-        println("ETF $etf: $(round(corr, digits=4))")
-    end
-    
-    println("\nForecast for next day:")
-    println("Volatilities:")
-    for (i, etf) in enumerate([etf_names; "rf"])
-        vol = sqrt(dcc_results["next_volatility"][i])
-        println("Asset $etf: $(round(vol, digits=6))")
-    end
-end
-
-# Execute the analysis
-etf_returns, rf_returns, returns, μ = preprocess_data(df, etf_names)
-dcc_results = dcc_garch(returns, μ)
-analyse_results(dcc_results, etf_names, returns, μ)
-
-# Function to examine correlation dynamics for specific pairs
-function plot_correlation_dynamics(dcc_results, etf_names, pair_indices)
-    T = size(dcc_results["correlations"], 1)
-    correlations = dcc_results["correlations"]
-    
-    println("\nCorrelation Dynamics for Selected Pairs:")
-    for (i, j) in pair_indices
-        name_i = i <= length(etf_names) ? etf_names[i] : "rf"
-        name_j = j <= length(etf_names) ? etf_names[j] : "rf"
-        
-        # Calculate correlation statistics
-        corr_series = [correlations[t, i, j] for t in 1:T]
-        avg_corr = mean(corr_series)
-        min_corr = minimum(corr_series)
-        max_corr = maximum(corr_series)
-        
-        println("$name_i - $name_j: avg = $(round(avg_corr, digits=4)), " *
-                "min = $(round(min_corr, digits=4)), max = $(round(max_corr, digits=4))")
-    end
-end
-
-#### Should we need to take into account the t-distribution, as the financial data are characterized by fat tails. 
-#### We can capture the fail-tails returns and it is better for the 
-
-### DCC-GARCH(1,1) model with Student's t-distribution
-### 29 ETF and 1 risk-free asset, so 30 variables with 4280 observations
-
-using CSV, DataFrames, Statistics, LinearAlgebra, Optim, SpecialFunctions
+# ══════════════════════════════════════════════════════════════════════════════
+#                              YOUR DATA LOADING CODE
+# ══════════════════════════════════════════════════════════════════════════════
 
 # Load data
-etf_rf = "/Users/kevin/Documents/University of Maastricht /Master Econometrics and Operations Research/Master Thesis /MasterThesis/Continuation of the BayesFlux/data/etfReturns.csv"
+etf_rf = "/Users/kevin/Documents/University of Maastricht /Master Econometrics and Operations Research/Master Thesis /MasterThesis/Continuation of the BayesFlux/scr/data/etfReturns.csv"
 df = CSV.read(etf_rf, DataFrame)
-
-etf_names = ["16383", "16386", "16388", "16397", "16403", "16412", "16414", "16418", 
-             "16421", "16423", "16424", "16426", "16433", "16437", "16452", "16460", 
-             "24697", "27635", "28272", "28273", "28274", "28275", "28276", "28277", 
+etf_names = ["16383", "16386", "16388", "16397", "16403", "16412", "16414", "16418",
+             "16421", "16423", "16424", "16426", "16433", "16437", "16452", "16460",
+             "24697", "27635", "28272", "28273", "28274", "28275", "28276", "28277",
              "28278", "28279", "28280", "31372", "31466"]
 
 # Data preprocessing with mean imputation
@@ -344,409 +29,509 @@ function preprocess_data(df, etf_names)
             df[!, col] = coalesce.(df[!, col], mean(skipmissing(df[!, col])))
         end
     end
+    # Also handle missing values in risk-free rate
+    if any(ismissing, df[!, "rf"])
+        df[!, "rf"] = coalesce.(df[!, "rf"], mean(skipmissing(df[!, "rf"])))
+    end
     
     etf_returns = Matrix{Float64}(df[!, etf_names])
     rf_returns = Vector{Float64}(df[!, "rf"])
-    returns = hcat(etf_returns, rf_returns)
-    
+    returns = hcat(etf_returns, rf_returns) # 30 assets: 29 ETFs + 1 risk-free
     # Calculate mean returns for each asset
     μ = mean(returns, dims=1)
-    
     return etf_returns, rf_returns, returns, vec(μ)
 end
 
-# Student's t log-density function
-function logdensity_t(x, df, location, scale)
-    # Log-density of the t-distribution
-    logconst = lgamma((df + 1)/2) - lgamma(df/2) - 0.5*log(df*π) - log(scale)
-    logpdf = logconst - ((df + 1)/2) * log(1 + ((x - location)/scale)^2/df)
-    return logpdf
+# Preprocess the data
+etf_returns, rf_returns, returns, μ_returns = preprocess_data(df, etf_names)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#                              UTILITY FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Mathematical helpers
+logit(x) = log(x / (1 - x))
+sigmoid(x) = 1 / (1 + exp(-x))
+nearest_pd(A) = (A + A') / 2 + 1e-6 * I
+
+# Transform parameters to ensure constraints
+function transform_garch_params(θ)
+    ω = exp(θ[1])  # ω > 0
+    α = sigmoid(θ[2])  # 0 < α < 1
+    β = sigmoid(θ[3]) * (1 - α)  # 0 < β, α + β < 1
+    return ω, α, β
 end
 
-# GARCH(1,1) with Student's t likelihood for parameter estimation
-function garch_t_likelihood(params, returns, μ_i)
-    ω, α, β, df = params
-    n = length(returns)
-    σ² = zeros(n)
+function transform_dcc_params(θ)
+    a = sigmoid(θ[1]) * 0.95  # 0 < a < 0.95
+    b = sigmoid(θ[2]) * (0.95 - a)  # 0 < b, a + b < 0.95
+    return a, b
+end
+
+# ══════════════════════════════════════════════════════════════════════════════
+#                              GARCH(1,1) IMPLEMENTATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+mutable struct GARCH11
+    ω::Float64
+    α::Float64
+    β::Float64
+    μ::Float64
+    σ²::Vector{Float64}
+    residuals::Vector{Float64}
+    loglik::Float64
+end
+
+function garch11_loglikelihood(θ, returns::Vector{Float64})
+    T = length(returns)
+    μ = θ[1]
+    ω, α, β = transform_garch_params(θ[2:4])
     
-    # Initialize with sample variance
-    σ²[1] = var(returns .- μ_i)
-    loglik = 0.0
+    # Check parameter constraints
+    if α + β >= 1.0 || ω <= 0 || α <= 0 || β <= 0
+        return -Inf
+    end
     
-    for t in 2:n
-        # Use squared deviation from mean
-        ε²_t_1 = (returns[t-1] - μ_i)^2
-        σ²[t] = max(ω + α * ε²_t_1 + β * σ²[t-1], 1e-8)
+    # Initialize conditional variance
+    σ² = zeros(T)
+    σ²[1] = var(returns)
+    
+    # Compute conditional variances
+    for t in 2:T
+        eps2_lag = (returns[t-1] - μ)^2
+        σ²[t] = ω + α * eps2_lag + β * σ²[t-1]
         
-        # Student's t log-likelihood contribution
-        σ_t = sqrt(σ²[t])
-        loglik += logdensity_t(returns[t] - μ_i, df, 0.0, σ_t)
-    end
-    
-    return -loglik
-end
-
-# Estimate GARCH parameters with Student's t errors
-function estimate_garch_t_params(returns, μ_i)
-    # Initial parameters [ω, α, β, df]
-    initial_params = [var(returns .- μ_i)*0.01, 0.1, 0.8, 6.0]
-    
-    function obj(params)
-        ω, α, β, df = params
-        if ω ≤ 0 || α < 0 || β < 0 || α + β ≥ 1 || df ≤ 2.1
-            return Inf
+        if σ²[t] <= 0
+            return -Inf
         end
-        return garch_t_likelihood(params, returns, μ_i)
     end
     
-    result = optimize(obj, initial_params, BFGS())
-    return Optim.minimizer(result)
-end
-
-# Fit univariate GARCH(1,1) with Student's t errors
-function fit_univariate_garch_t(returns, μ_i)
-    n = length(returns)
-    ω, α, β, df = estimate_garch_t_params(returns, μ_i)
-    
-    # Conditional variance
-    σ² = zeros(n)
-    σ²[1] = var(returns .- μ_i)
-    
-    # Standardized residuals with adjustment for t distribution
-    # For t-distribution, variance = df/(df-2), so we adjust to get unit variance residuals
-    scale_factor = sqrt((df - 2)/df)
-    
-    ε = returns .- μ_i
-    ν = zeros(n)
-    ν[1] = ε[1] / (sqrt(σ²[1]) * scale_factor)
-    
-    for t in 2:n
-        σ²[t] = ω + α * ε[t-1]^2 + β * σ²[t-1]
-        ν[t] = ε[t] / (sqrt(σ²[t]) * scale_factor)
-    end
-    
-    # Forecast one step ahead variance
-    σ²_next = ω + α * ε[n]^2 + β * σ²[n]
-    
-    return σ², ν, (ω, α, β, df), σ²_next
-end
-
-# Calculate R_bar (Bollerslev's CCC estimator) with robustness
-function calculate_R_bar(standardized_residuals)
-    T, n = size(standardized_residuals)
-    R_bar = zeros(n, n)
-    
-    # R_bar = (1/T) * sum(ν_t * ν_t')
+    # Compute log-likelihood
+    loglik = 0.0
     for t in 1:T
-        R_bar .+= standardized_residuals[t, :] * standardized_residuals[t, :]'
-    end
-    R_bar ./= T
-    
-    # Ensure R_bar is a proper correlation matrix
-    D_inv = Diagonal(1.0 ./ sqrt.(diag(R_bar)))
-    R_bar = D_inv * R_bar * D_inv
-    
-    # Ensure positive definiteness
-    eigvals_R = eigvals(R_bar)
-    if minimum(eigvals_R) <= 0
-        R_bar += Diagonal(max(1e-4, -minimum(eigvals_R) + 1e-4) * ones(n))
-        # Re-normalize to correlation matrix
-        D_inv = Diagonal(1.0 ./ sqrt.(diag(R_bar)))
-        R_bar = D_inv * R_bar * D_inv
+        eps = returns[t] - μ
+        loglik -= 0.5 * (log(2π) + log(σ²[t]) + eps^2/σ²[t])
     end
     
-    return R_bar
+    return loglik
 end
 
-# Multivariate Student's t log-density
-function multivariate_t_logdensity(x, df, Σ)
-    n = length(x)
-    # Log-density of multivariate t
-    logconst = lgamma((df + n)/2) - lgamma(df/2) - (n/2)*log(df*π) - 0.5*logdet(Σ)
-    quad_form = x' * inv(Σ) * x
-    logpdf = logconst - ((df + n)/2) * log(1 + quad_form/df)
-    return logpdf
+function estimate_garch11(returns::Vector{Float64}; max_iter=1000)
+    # Initial parameter guess
+    μ_init = mean(returns)
+    σ²_sample = var(returns)
+    ω_init = log(0.1 * σ²_sample)
+    α_init = logit(0.1)
+    β_init = logit(0.8)
+    θ₀ = [μ_init, ω_init, α_init, β_init]
+    
+    # Optimization
+    objective = θ -> -garch11_loglikelihood(θ, returns)
+    result = optimize(objective, θ₀, BFGS(), 
+                     Optim.Options(iterations=max_iter, show_trace=false))
+    
+    if !Optim.converged(result)
+        @warn "GARCH optimization did not converge"
+    end
+    
+    θ_opt = Optim.minimizer(result)
+    μ = θ_opt[1]
+    ω, α, β = transform_garch_params(θ_opt[2:4])
+    
+    # Compute fitted values
+    T = length(returns)
+    σ² = zeros(T)
+    σ²[1] = var(returns)
+    
+    for t in 2:T
+        eps2_lag = (returns[t-1] - μ)^2
+        σ²[t] = ω + α * eps2_lag + β * σ²[t-1]
+    end
+    
+    # Standardized residuals
+    residuals = (returns .- μ) ./ sqrt.(σ²)
+    loglik = garch11_loglikelihood(θ_opt, returns)
+    
+    return GARCH11(ω, α, β, μ, σ², residuals, loglik)
 end
 
-# DCC likelihood with Student's t distribution
-function dcc_t_likelihood(params, standardized_residuals, R_bar, df_vec)
-    a, b, df_dcc = params
-    T, n = size(standardized_residuals)
+# ══════════════════════════════════════════════════════════════════════════════
+#                              DCC MODEL IMPLEMENTATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+mutable struct DCCModel
+    garch_models::Vector{GARCH11}
+    a::Float64
+    b::Float64
+    Q̄::Matrix{Float64}
+    Q::Array{Float64,3}
+    R::Array{Float64,3}
+    H::Array{Float64,3}
+    loglik::Float64
+    residuals::Matrix{Float64}
+    n_assets::Int
+    estimation_time::Float64
+end
+
+function dcc_loglikelihood(θ, standardized_residuals::Matrix{Float64})
+    T, N = size(standardized_residuals)
+    a, b = transform_dcc_params(θ)
     
-    # Use  degrees of freedom from individual GARCH models as starting point
-    # but estimate a common df for the multivariate model
+    if a + b >= 0.95 || a <= 0 || b <= 0
+        return -Inf
+    end
     
-    # Initialize Q_t with unconditional correlation R_bar
-    Q_prev = copy(R_bar)
+    Q̄ = cor(standardized_residuals)
+    Q = zeros(N, N, T)
+    Q[:, :, 1] = Q̄
     loglik = 0.0
     
-    for t in 2:T
-        # Calculate Q_t according to the DCC equation
-        ν_prod = standardized_residuals[t-1, :] * standardized_residuals[t-1, :]'
-        Q_t = R_bar * (1 - a - b) + a * ν_prod + b * Q_prev
-        
-        # Ensure Q_t is symmetric and positive definite
-        Q_t = (Q_t + Q_t') / 2
-        eigvals_Q = eigvals(Q_t)
-        if minimum(eigvals_Q) <= 0
-            Q_t += Diagonal(max(1e-4, -minimum(eigvals_Q) + 1e-4) * ones(n))
+    for t in 1:T
+        if t > 1
+            z_lag = standardized_residuals[t-1, :]
+            Q[:, :, t] = (1 - a - b) .* Q̄ .+ a .* (z_lag * z_lag') .+ b .* Q[:, :, t-1]
         end
         
-        # Compute correlation matrix from Q_t
-        Q_diag_inv = Diagonal(1.0 ./ sqrt.(diag(Q_t)))
-        R_t = Q_diag_inv * Q_t * Q_diag_inv
+        Q_t = Symmetric(Q[:, :, t])
+        D_inv = Diagonal(1 ./ sqrt.(max.(diag(Q_t), 1e-8)))
+        R_t = Symmetric(D_inv * Q_t * D_inv)
+        R_t = nearest_pd(R_t)
         
-        # For multivariate t, we use the correlation matrix for the shape
-        # and the degrees of freedom for tail behavior
-        ν_t = standardized_residuals[t, :]
-        
-        # Add to log-likelihood using multivariate t
-        loglik += multivariate_t_logdensity(ν_t, df_dcc, R_t)
-        
-        Q_prev = Q_t
-    end
-    
-    return -loglik
-end
-
-# Estimate DCC parameters with Student's t distribution
-function estimate_dcc_t_params(standardized_residuals, R_bar, df_vec)
-    # Start with average df from univariate models, but let it be estimated
-    avg_df = mean(df_vec)
-    
-    function obj(params)
-        a, b, df_dcc = params
-        if a < 0 || b < 0 || a + b >= 1 || df_dcc <= 2.1
-            return Inf
+        try
+            L = cholesky(R_t).L
+            z_t = standardized_residuals[t, :]
+            loglik -= 0.5 * (N * log(2π) + 2 * sum(log, diag(L)) + dot(z_t, R_t \ z_t))
+        catch
+            return -Inf
         end
-        return dcc_t_likelihood(params, standardized_residuals, R_bar, df_vec)
     end
     
-    initial_params = [0.01, 0.97, avg_df]
-    result = optimize(obj, initial_params, BFGS())
-    return Optim.minimizer(result)
+    return loglik
 end
 
-# Main DCC-GARCH with Student's t distribution
-function dcc_garch_t(returns, μ)
-    T, n = size(returns)
+function estimate_dcc(returns::Matrix{Float64}; max_iter=1000, verbose=true)
+    start_time = time()
+    T, N = size(returns)
     
-    # First stage: Fit univariate GARCH models with Student's t for each series
-    σ² = zeros(T, n)
-    σ²_next = zeros(n)
-    ν = zeros(T, n)
-    garch_params = Vector{Tuple{Float64, Float64, Float64, Float64}}(undef, n)
-    df_vec = zeros(n)
-    
-    for i in 1:n
-        σ²[:, i], ν[:, i], garch_params[i], σ²_next[i] = fit_univariate_garch_t(returns[:, i], μ[i])
-        df_vec[i] = garch_params[i][4]  # Store degrees of freedom
+    if verbose
+        println("Estimating DCC model for $N assets over $T periods...")
     end
     
-    # Calculate R_bar based on standardized residuals
-    R_bar = calculate_R_bar(ν)
+    # Stage 1: Estimate individual GARCH models
+    if verbose
+        println("Stage 1: Estimating individual GARCH(1,1) models...")
+    end
+    garch_models = Vector{GARCH11}(undef, N)
     
-    # Second stage: Estimate DCC parameters with multivariate t
-    a, b, df_dcc = estimate_dcc_t_params(ν, R_bar, df_vec)
+    for i in 1:N
+        if verbose
+            print("  Asset $i... ")
+        end
+        garch_models[i] = estimate_garch11(returns[:, i])
+        if verbose
+            println("✓")
+        end
+    end
     
-    # Calculate dynamic correlation matrices
-    Q = zeros(T, n, n)
-    Q[1, :, :] = R_bar
-    R = zeros(T, n, n)
-    R[1, :, :] = R_bar
-    H = zeros(T, n, n)
+    # Extract standardized residuals
+    residuals = hcat([model.residuals for model in garch_models]...)
     
-    # Initialize first conditional covariance matrix
-    D_1 = Diagonal(sqrt.(σ²[1, :]))
-    H[1, :, :] = D_1 * R[1, :, :] * D_1
+    # Stage 2: Estimate DCC parameters
+    if verbose
+        println("Stage 2: Estimating DCC parameters...")
+    end
+    θ₀ = [logit(0.02), logit(0.95)]
     
-    for t in 2:T
-        # Update Q matrix according to DCC equation
-        ν_prod = ν[t-1, :] * ν[t-1, :]'
-        Q[t, :, :] = (1 - a - b) * R_bar + a * ν_prod + b * Q[t-1, :, :]
-        
-        # Ensure symmetry and positive definiteness
-        Q[t, :, :] = (Q[t, :, :] + Q[t, :, :]') / 2
-        eigvals_Q = eigvals(Q[t, :, :])
-        if minimum(eigvals_Q) <= 0
-            Q[t, :, :] += Diagonal(max(1e-4, -minimum(eigvals_Q) + 1e-4) * ones(n))
+    objective = θ -> -dcc_loglikelihood(θ, residuals)
+    result = optimize(objective, θ₀, BFGS(), 
+                     Optim.Options(iterations=max_iter, show_trace=false))
+    
+    if !Optim.converged(result)
+        @warn "DCC optimization did not converge"
+    end
+    
+    θ_opt = Optim.minimizer(result)
+    a, b = transform_dcc_params(θ_opt)
+    
+    # Compute fitted DCC matrices
+    Q̄ = cor(residuals)
+    Q = zeros(N, N, T)
+    R = zeros(N, N, T)
+    H = zeros(N, N, T)
+    
+    Q[:, :, 1] = Q̄
+    
+    for t in 1:T
+        if t > 1
+            z_lag = residuals[t-1, :]
+            Q[:, :, t] = (1 - a - b) .* Q̄ .+ a .* (z_lag * z_lag') .+ b .* Q[:, :, t-1]
         end
         
-        # Compute correlation matrix R from Q
-        Q_diag_inv = Diagonal(1.0 ./ sqrt.(diag(Q[t, :, :])))
-        R[t, :, :] = Q_diag_inv * Q[t, :, :] * Q_diag_inv
+        Q_t = Symmetric(Q[:, :, t])
+        D_inv = Diagonal(1 ./ sqrt.(max.(diag(Q_t), 1e-8)))
+        R[:, :, t] = D_inv * Q_t * D_inv
         
-        # Compute conditional covariance matrix
-        D_t = Diagonal(sqrt.(σ²[t, :]))
-        H[t, :, :] = D_t * R[t, :, :] * D_t
+        D_t = Diagonal(sqrt.([garch_models[i].σ²[t] for i in 1:N]))
+        H[:, :, t] = D_t * R[:, :, t] * D_t
     end
     
-    # Calculate one-step-ahead correlation and covariance matrices
-    Q_next = (1 - a - b) * R_bar + a * (ν[T, :] * ν[T, :]') + b * Q[T, :, :]
-    Q_next = (Q_next + Q_next') / 2
+    # Total log-likelihood
+    stage1_loglik = sum(model.loglik for model in garch_models)
+    stage2_loglik = dcc_loglikelihood(θ_opt, residuals)
+    total_loglik = stage1_loglik + stage2_loglik
     
-    # Ensure positive definiteness of next-step Q
-    eigvals_Q = eigvals(Q_next)
-    if minimum(eigvals_Q) <= 0
-        Q_next += Diagonal(max(1e-4, -minimum(eigvals_Q) + 1e-4) * ones(n))
+    estimation_time = time() - start_time
+    
+    if verbose
+        println("  DCC parameters: a=$(round(a, digits=4)), b=$(round(b, digits=4))")
+        println("  Total log-likelihood: $(round(total_loglik, digits=2))")
+        println("  Estimation time: $(round(estimation_time, digits=2)) seconds")
     end
     
-    Q_diag_inv = Diagonal(1.0 ./ sqrt.(diag(Q_next)))
-    R_next = Q_diag_inv * Q_next * Q_diag_inv
-    
-    D_next = Diagonal(sqrt.(σ²_next))
-    H_next = D_next * R_next * D_next
-    
-    return Dict(
-        "correlations" => R,
-        "next_correlation" => R_next,
-        "volatilities" => σ²,
-        "next_volatility" => σ²_next,
-        "standardized_residuals" => ν,
-        "garch_params" => garch_params,
-        "dcc_params" => (a, b, df_dcc),
-        "conditional_cov" => H,
-        "next_cov" => H_next,
-        "R_bar" => R_bar,
-        "df_univariate" => df_vec
-    )
+    return DCCModel(garch_models, a, b, Q̄, Q, R, H, total_loglik, residuals, N, estimation_time)
 end
 
-# Enhanced analysis function for t-distribution
-function analyse_results_t(dcc_results, etf_names, returns, μ)
-    n = length(etf_names) + 1  # Including risk-free
-    
-    println("\nMean returns:")
-    for (i, etf) in enumerate(etf_names)
-        println("ETF $etf: $(μ[i])")
-    end
-    println("Risk-free: $(μ[end])")
-    
-    println("\nGARCH(1,1) Parameters with Student's t distribution for each asset:")
-    for (i, etf) in enumerate([etf_names; "rf"])
-        ω, α, β, df = dcc_results["garch_params"][i]
-        persistence = α + β
-        uncond_var = ω / (1 - persistence)
-        println("Asset $etf: ω = $(round(ω, digits=6)), α = $(round(α, digits=4)), " *
-                "β = $(round(β, digits=4)), df = $(round(df, digits=2)), " *
-                "persistence = $(round(persistence, digits=4)), " *
-                "unconditional variance = $(round(uncond_var, digits=6))")
-    end
-    
-    a, b, df_dcc = dcc_results["dcc_params"]
-    println("\nDCC Parameters with multivariate t-distribution:")
-    println("a = $(round(a, digits=4))")
-    println("b = $(round(b, digits=4))")
-    println("Persistence (a + b) = $(round(a + b, digits=4))")
-    println("Degrees of freedom (multivariate) = $(round(df_dcc, digits=2))")
-    
-    # Compare univariate and multivariate df
-    println("\nUnivariate vs. Multivariate degrees of freedom:")
-    println("Average univariate df = $(round(mean(dcc_results["df_univariate"]), digits=2))")
-    println("Min univariate df = $(round(minimum(dcc_results["df_univariate"]), digits=2))")
-    println("Max univariate df = $(round(maximum(dcc_results["df_univariate"]), digits=2))")
-    println("Multivariate df = $(round(df_dcc, digits=2))")
-    
-    println("\nUnconditional correlation matrix (R_bar):")
-    R_bar = dcc_results["R_bar"]
-    println("Average absolute correlation: $(round(mean(abs.(R_bar - Diagonal(diag(R_bar)))), digits=4))")
-    
-    T = size(returns, 1)
-    println("\nFinal day correlations with risk-free rate:")
-    for (i, etf) in enumerate(etf_names)
-        corr = dcc_results["correlations"][T, i, end]
-        println("ETF $etf: $(round(corr, digits=4))")
-    end
-    
-    println("\nForecast for next day:")
-    println("Volatilities:")
-    for (i, etf) in enumerate([etf_names; "rf"])
-        vol = sqrt(dcc_results["next_volatility"][i])
-        println("Asset $etf: $(round(vol, digits=6))")
-    end
-    
-    # Tail risk analysis
-    println("\nTail Risk Analysis:")
-    println("Student's t-distribution captures fatter tails than Normal distribution.")
-    println("Assets with lowest df (heaviest tails):")
-    df_vec = [dcc_results["garch_params"][i][4] for i in 1:n]
-    sorted_indices = sortperm(df_vec)
-    for i in 1:min(5, n)
-        idx = sorted_indices[i]
-        asset_name = idx <= length(etf_names) ? etf_names[idx] : "rf"
-        println("Asset $asset_name: df = $(round(df_vec[idx], digits=2))")
-    end
-end
+# ══════════════════════════════════════════════════════════════════════════════
+#                              MULTI-ASSET ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════════
 
-# Function to compare VaR estimates between Normal and t distributions
-function calculate_var_comparison(dcc_results, returns, μ, confidence_levels=[0.95, 0.99])
-    T, n = size(returns)
+function run_multi_asset_analysis(returns::Matrix{Float64}, asset_counts::Vector{Int}; 
+                                 train_split::Float64=0.8, verbose::Bool=true)
+    """Run DCC-GARCH analysis for multiple asset counts"""
     
-    # Last day volatilities
-    last_volatilities = sqrt.(dcc_results["volatilities"][T, :])
-    next_volatilities = sqrt.(dcc_results["next_volatility"])
+    println("MULTI-ASSET DCC-GARCH ANALYSIS")
+    println("="^60)
+    println("Total available assets: $(size(returns, 2))")
+    println("Asset counts to analyze: $asset_counts")
+    println("Train-test split: $(Int(train_split*100))%-$(Int((1-train_split)*100))%")
+    println()
     
-    println("\nValue at Risk (VaR) Comparison:")
-    println("Normal vs. Student's t for next day returns:")
+    # Train-test split
+    T_total = size(returns, 1)
+    train_size = Int(floor(train_split * T_total))
     
-    for (i, asset) in enumerate([etf_names; "rf"])
-        df = dcc_results["garch_params"][i][4]
-        vol = next_volatilities[i]
+    results = Dict()
+    summary_stats = []
+    
+    for n_assets in asset_counts
+        println("="^60)
+        println("ANALYZING $n_assets ASSETS")
+        println("="^60)
         
-        println("\nAsset $asset:")
-        println("Forecast volatility: $(round(vol, digits=6))")
-        println("Degrees of freedom: $(round(df, digits=2))")
+        if n_assets > size(returns, 2)
+            println("⚠️  Requested $n_assets assets but only $(size(returns, 2)) available. Skipping...")
+            continue
+        end
         
-        for cl in confidence_levels
-            # Normal VaR
-            normal_quantile = quantile(Normal(), 1-cl)
-            normal_var = μ[i] + normal_quantile * vol
+        # Select subset of assets
+        if n_assets == size(returns, 2)
+            selected_returns = returns
+        else
+            selected_returns = returns[:, 1:n_assets]
+        end
+        
+        train_returns = selected_returns[1:train_size, :]
+        test_returns = selected_returns[train_size+1:end, :]
+        
+        println("Training data: $(size(train_returns))")
+        println("Test data: $(size(test_returns))")
+        println()
+        
+        # Estimate DCC model
+        try
+            dcc_model = estimate_dcc(train_returns, verbose=verbose)
             
-            # Student's t VaR
-            t_quantile = quantile(TDist(df), 1-cl)
-            # Adjust for different variance - t with df degrees of freedom has variance df/(df-2)
-            scale_factor = sqrt((df-2)/df)
-            t_var = μ[i] + t_quantile * vol / scale_factor
+            # Calculate model diagnostics
+            aic = -2 * dcc_model.loglik + 2 * (4*n_assets + 2)
+            bic = -2 * dcc_model.loglik + log(train_size) * (4*n_assets + 2)
             
-            # Relative difference
-            rel_diff = (t_var - normal_var) / normal_var * 100
+            # Calculate average correlation
+            avg_correlation = if n_assets > 1
+                mean([dcc_model.R[i,j,t] for t in 1:train_size for i in 1:n_assets for j in 1:n_assets if i < j])
+            else
+                0.0
+            end
             
-            println("$(cl*100)% VaR:")
-            println("  Normal: $(round(normal_var, digits=6))")
-            println("  Student's t: $(round(t_var, digits=6))")
-            println("  Difference: $(round(rel_diff, digits=2))% (t is $(rel_diff < 0 ? "less" : "more") conservative)")
+            # Store results
+            results[n_assets] = Dict(
+                "model" => dcc_model,
+                "train_returns" => train_returns,
+                "test_returns" => test_returns,
+                "loglik" => dcc_model.loglik,
+                "aic" => aic,
+                "bic" => bic,
+                "avg_correlation" => avg_correlation,
+                "estimation_time" => dcc_model.estimation_time,
+                "dcc_params" => (dcc_model.a, dcc_model.b),
+                "persistence" => dcc_model.a + dcc_model.b
+            )
+            
+            # Add to summary stats
+            push!(summary_stats, [
+                n_assets,
+                round(dcc_model.loglik, digits=2),
+                round(aic, digits=2),
+                round(bic, digits=2),
+                round(dcc_model.a, digits=4),
+                round(dcc_model.b, digits=4),
+                round(dcc_model.a + dcc_model.b, digits=4),
+                round(avg_correlation, digits=4),
+                round(dcc_model.estimation_time, digits=2)
+            ])
+            
+            println("✅ Successfully estimated DCC model for $n_assets assets")
+            
+        catch e
+            println("❌ Failed to estimate DCC model for $n_assets assets")
+            println("Error: $e")
+            continue
         end
+        
+        println()
     end
+    
+    # Print summary table
+    print_summary_table(summary_stats)
+    
+    # Generate comparison plots
+    if length(results) > 1
+        create_comparison_plots(results)
+    end
+    
+    return results
 end
 
-# Execute the analysis with Student's t distribution
-etf_returns, rf_returns, returns, μ = preprocess_data(df, etf_names)
-dcc_results_t = dcc_garch_t(returns, μ)
-analyse_results_t(dcc_results_t, etf_names, returns, μ)
-
-# Calculate Value at Risk comparisons
-using Distributions
-calculate_var_comparison(dcc_results_t, returns, μ)
-
-# Function to examine correlation dynamics for specific pairs
-function plot_correlation_dynamics(dcc_results, etf_names, pair_indices)
-    T = size(dcc_results["correlations"], 1)
-    correlations = dcc_results["correlations"]
+function print_summary_table(summary_stats)
+    """Print formatted summary table"""
+    println("="^100)
+    println("SUMMARY COMPARISON TABLE")
+    println("="^100)
     
-    println("\nCorrelation Dynamics for Selected Pairs:")
-    for (i, j) in pair_indices
-        name_i = i <= length(etf_names) ? etf_names[i] : "rf"
-        name_j = j <= length(etf_names) ? etf_names[j] : "rf"
+    headers = ["Assets", "Log-Lik", "AIC", "BIC", "DCC-a", "DCC-b", "Persist.", "Avg.Corr", "Time(s)"]
+    
+    # Print headers
+    for (i, header) in enumerate(headers)
+        print(rpad(header, 10))
+        if i < length(headers)
+            print(" │ ")
+        end
+    end
+    println()
+    
+    # Print separator
+    println("─"^(10*length(headers) + 3*(length(headers)-1)))
+    
+    # Print data rows
+    for row in summary_stats
+        for (i, val) in enumerate(row)
+            print(rpad(string(val), 10))
+            if i < length(row)
+                print(" │ ")
+            end
+        end
+        println()
+    end
+    println("="^100)
+end
+
+function create_comparison_plots(results)
+    """Create comparison plots across different asset counts"""
+    asset_counts = sort(collect(keys(results)))
+    
+    # Extract metrics for plotting
+    logliks = [results[n]["loglik"] for n in asset_counts]
+    aics = [results[n]["aic"] for n in asset_counts]
+    bics = [results[n]["bic"] for n in asset_counts]
+    dcc_a = [results[n]["dcc_params"][1] for n in asset_counts]
+    dcc_b = [results[n]["dcc_params"][2] for n in asset_counts]
+    persistence = [results[n]["persistence"] for n in asset_counts]
+    avg_corrs = [results[n]["avg_correlation"] for n in asset_counts]
+    times = [results[n]["estimation_time"] for n in asset_counts]
+    
+    # Create plots
+    p1 = plot(asset_counts, logliks, marker=:circle, linewidth=2,
+              title="Log-Likelihood", xlabel="Number of Assets", ylabel="Log-Likelihood",
+              legend=false, color=:blue)
+    
+    p2 = plot(asset_counts, [aics bics], marker=[:circle :square], linewidth=2,
+              title="Information Criteria", xlabel="Number of Assets", ylabel="IC Value",
+              label=["AIC" "BIC"], colors=[:red :orange])
+    
+    p3 = plot(asset_counts, [dcc_a dcc_b persistence], marker=[:circle :square :diamond], linewidth=2,
+              title="DCC Parameters", xlabel="Number of Assets", ylabel="Parameter Value",
+              label=["DCC-a" "DCC-b" "Persistence"], colors=[:green :purple :brown])
+    
+    p4 = plot(asset_counts, avg_corrs, marker=:circle, linewidth=2,
+              title="Average Correlation", xlabel="Number of Assets", ylabel="Correlation",
+              legend=false, color=:teal)
+    
+    p5 = plot(asset_counts, times, marker=:circle, linewidth=2,
+              title="Estimation Time", xlabel="Number of Assets", ylabel="Time (seconds)",
+              legend=false, color=:red, yscale=:log10)
+    
+    # Combine plots
+    combined_plot = plot(p1, p2, p3, p4, p5, layout=(3, 2), size=(1200, 1000),
+                        plot_title="DCC-GARCH Model Comparison Across Asset Counts")
+    
+    display(combined_plot)
+    
+    return combined_plot
+end
+
+function analyze_correlation_dynamics(results)
+    """Analyze correlation dynamics across different asset counts"""
+    println("\nCORRELATION DYNAMICS ANALYSIS")
+    println("="^50)
+    
+    for (n_assets, result) in results
+        if n_assets == 1
+            continue  # Skip single asset
+        end
+        
+        model = result["model"]
+        T = size(model.R, 3)
         
         # Calculate correlation statistics
-        corr_series = [correlations[t, i, j] for t in 1:T]
-        avg_corr = mean(corr_series)
-        min_corr = minimum(corr_series)
-        max_corr = maximum(corr_series)
-        std_corr = std(corr_series)
+        correlations = []
+        for t in 1:T
+            for i in 1:n_assets
+                for j in (i+1):n_assets
+                    push!(correlations, model.R[i, j, t])
+                end
+            end
+        end
         
-        println("$name_i - $name_j: avg = $(round(avg_corr, digits=4)), " *
-                "min = $(round(min_corr, digits=4)), max = $(round(max_corr, digits=4)), " *
-                "std = $(round(std_corr, digits=4))")
+        avg_corr = mean(correlations)
+        std_corr = std(correlations)
+        min_corr = minimum(correlations)
+        max_corr = maximum(correlations)
+        
+        println("$n_assets Assets:")
+        println("  Average correlation: $(round(avg_corr, digits=4))")
+        println("  Std deviation: $(round(std_corr, digits=4))")
+        println("  Range: [$(round(min_corr, digits=4)), $(round(max_corr, digits=4))]")
+        println()
     end
 end
+
+# ══════════════════════════════════════════════════════════════════════════════
+#                              MAIN EXECUTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Run analysis for 2, 5, 10, and 30 assets
+asset_counts = [2, 5, 10, 30]
+
+println("Starting multi-asset DCC-GARCH analysis...")
+println("Available data shape: $(size(returns))")
+println()
+
+# Run the comprehensive analysis
+results = run_multi_asset_analysis(returns, asset_counts, train_split=0.8, verbose=true)
+
+# Additional correlation dynamics analysis
+analyze_correlation_dynamics(results)
+
+# Save results summary
+println("\nAnalysis complete! Results stored in 'results' dictionary.")
+println("Access individual models: results[n_assets][\"model\"]")
+println("Available asset counts: $(sort(collect(keys(results))))")

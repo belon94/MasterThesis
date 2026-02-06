@@ -1027,7 +1027,7 @@ chn = Chains(permutedims(draws,(2,1)), param_names)
 ###############
 
 ###############################################################################
-#  DCC–GARCH Bayesian neural-network example (BayesFlux.jl)                   #
+#  DCC–GARCH Bayesian neural-network (BayesFlux.jl)                 
 ###############################################################################
 using Flux,BayesFlux
 using Random, Distributions, LinearAlgebra, Plots

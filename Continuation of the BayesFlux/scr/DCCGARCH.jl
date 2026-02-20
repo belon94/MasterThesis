@@ -9,6 +9,7 @@ using Optim, Distributions
 using LinearAlgebra, Statistics
 using CSV, DataFrames
 using Printf, Plots, StatsPlots
+using StatsBase
 
 # ══════════════════════════════════════════════════════════════════════════════
 #                      UTILITY & PORTFOLIO FUNCTIONS
@@ -213,6 +214,7 @@ function classical_dcc_garch_analysis(data_path::String, n_assets::Int)
     portfolio_returns = zeros(Float64, n_test); daily_portfolio_vars = Vector{Vector{Float64}}(undef, n_test)
     daily_portfolio_weights = zeros(Float32, n_assets, n_test); daily_portfolio_volatility = zeros(Float64, n_test)
     training_rmses = zeros(Float64, n_test); test_squared_errors = zeros(Float64, n_test, n_assets)
+    dcc_alpha_values = zeros(Float64, n_test); dcc_beta_values = zeros(Float64, n_test)
 
     for (i, t) in enumerate(test_indices)
         if i % 50 == 0; @printf "Processing forecast %d/%d (Day %d)...\n" i n_test t; end
@@ -226,9 +228,12 @@ function classical_dcc_garch_analysis(data_path::String, n_assets::Int)
             @warn "Model fitting failed at step $i. Skipping."; portfolio_returns[i] = NaN
             daily_portfolio_vars[i] = [NaN, NaN, NaN]; daily_portfolio_weights[:, i] .= NaN
             daily_portfolio_volatility[i] = NaN; training_rmses[i] = NaN; test_squared_errors[i, :] .= NaN
+            dcc_alpha_values[i] = NaN; dcc_beta_values[i] = NaN
             continue; end
         
         training_rmses[i] = model.training_rmse
+        dcc_alpha_values[i] = model.dcc_params[1]
+        dcc_beta_values[i] = model.dcc_params[2]
         last_day_returns = returns_selected[window_end, :]
         H_forecast, μ_forecast = forecast_dcc_garch(model, last_day_returns)
         
@@ -246,9 +251,11 @@ function classical_dcc_garch_analysis(data_path::String, n_assets::Int)
     valid_returns = portfolio_returns[valid_indices]; valid_vars = daily_portfolio_vars[valid_indices]
     valid_weights = daily_portfolio_weights[:, valid_indices]; valid_vols = daily_portfolio_volatility[valid_indices]
     valid_train_rmses = training_rmses[valid_indices]; valid_test_sq_err = test_squared_errors[valid_indices, :]
+    valid_dcc_alpha = dcc_alpha_values[valid_indices]; valid_dcc_beta = dcc_beta_values[valid_indices]
 
     avg_training_rmse = mean(valid_train_rmses)
     test_rmse = sqrt(mean(valid_test_sq_err))
+    avg_dcc_params = [mean(valid_dcc_alpha), mean(valid_dcc_beta)]
     
     print_classical_portfolio_summary(valid_returns, valid_vols, valid_vars, avg_training_rmse, test_rmse)
     
@@ -274,7 +281,7 @@ function classical_dcc_garch_analysis(data_path::String, n_assets::Int)
         println("\nVaR backtesting could not be performed.")
     end
     
-    save_classical_results(valid_returns, valid_vars, valid_weights, var_backtest_results, n_assets)
+    save_classical_results(valid_returns, valid_vars, valid_weights, var_backtest_results, n_assets, avg_training_rmse, test_rmse, avg_dcc_params)
     plot_and_save_visuals(valid_returns, valid_vars, var_backtest_results, valid_vols, asset_names)
 end
 
@@ -356,7 +363,7 @@ function plot_and_save_visuals(portfolio_returns, daily_vars, backtest_results, 
     println(" MVP volatility plot saved as classical_mvp_volatility_$(n_assets)_assets.png")
 end
 
-function save_classical_results(portfolio_returns, daily_vars, portfolio_weights, backtest_results, n_assets)
+function save_classical_results(portfolio_returns, daily_vars, portfolio_weights, backtest_results, n_assets, training_rmse, test_rmse, dcc_params)
     println("\n Saving results to CSV files..."); results_dir = "classical_dcc_results"; !isdir(results_dir) && mkdir(results_dir)
     n_obs = length(portfolio_returns)
     var_df = DataFrame(Day = 1:n_obs, Actual_Return = portfolio_returns, VaR_1_percent = [v[1] for v in daily_vars],
@@ -369,6 +376,36 @@ function save_classical_results(portfolio_returns, daily_vars, portfolio_weights
         basel_str = result.BASEL == 1 ? "Green" : (result.BASEL == 0 ? "Yellow" : "Red")
         push!(summary_df, (alpha, result.PF, result.TUFF, result.LRUC, result.LRIND, result.LRCC, basel_str)); end
     CSV.write(joinpath(results_dir, "var_backtest_summary_$(n_assets)_assets.csv"), summary_df); println("   ✓ VaR backtest summary saved.")
+    
+    # Save model performance summary
+    perf_df = DataFrame(
+        Model = ["Classical DCC-GARCH"],
+        N_Assets = [n_assets],
+        Training_RMSE = [training_rmse],
+        Test_RMSE = [test_rmse],
+        DCC_alpha = [dcc_params[1]],
+        DCC_beta = [dcc_params[2]]
+    )
+    CSV.write(joinpath(results_dir, "model_performance_summary_$(n_assets)_assets.csv"), perf_df)
+    println("   ✓ Model performance summary saved.")
+    
+    # Save portfolio statistics (only for 30 assets)
+    if n_assets == 30
+        stats_df = DataFrame(
+            Statistic = ["Mean", "Std", "Min", "Max", "Skewness", "Kurtosis"],
+            Value = [
+                mean(portfolio_returns),
+                std(portfolio_returns),
+                minimum(portfolio_returns),
+                maximum(portfolio_returns),
+                skewness(portfolio_returns),
+                kurtosis(portfolio_returns)
+            ]
+        )
+        CSV.write(joinpath(results_dir, "portfolio_statistics_30_assets.csv"), stats_df)
+        println("   ✓ Portfolio statistics saved (30 assets only).")
+    end
+    
     println("All results for $n_assets assets saved in '$results_dir'.")
 end
 

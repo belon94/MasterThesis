@@ -2,6 +2,7 @@
 #   DCC-GARCH Bayesian Neural Network - Complete Multi-Asset Analysis
 #  With Train/Validation/Test Splits and Rolling Window Forecasting
 #  RMSE-Only Evaluation
+#Basel_Zone 0 -> Yellow (Acceptable), -1→ Red (Too many violations), 1→ Green (Good model)
 ###############################################################################
 
 using Flux, BayesFlux

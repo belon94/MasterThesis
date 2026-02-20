@@ -24,6 +24,9 @@ const CHI2_1_01 = 6.63
 const CHI2_2_05 = 5.99  
 const CHI2_2_01 = 9.21  
 
+# Output folder
+const OUTPUT_FOLDER = "bnn_dcc_results"
+
 # ══════════════════════════════════════════════════════════════════════════════
 #                              VAR RESULTS STRUCTURE & BACKTESTING
 # ══════════════════════════════════════════════════════════════════════════════
@@ -281,11 +284,14 @@ function plot_enhanced_var_analysis(portfolio_returns::Vector{Float64}, daily_po
     end
 end
 
-function save_results_to_csv(all_results::Dict{Int64, Dict{String, Dict{Symbol, Any}}}, model_name::String = "BNN")
+# ══════════════════════════════════════════════════════════════════════════════
+#                         UPDATED CSV SAVING - SAVES BOTH RNN AND LSTM
+# ══════════════════════════════════════════════════════════════════════════════
+
+function save_results_to_csv(all_results::Dict{Int64, Dict{String, Dict{Symbol, Any}}}, output_folder::String = OUTPUT_FOLDER)
     println("\nSaving results to CSV files...")
     
-    results_dir = "bnn_dcc_results"
-    !isdir(results_dir) && mkdir(results_dir)
+    !isdir(output_folder) && mkdir(output_folder)
     
     for (n_assets, data_dict) in all_results
         println("  Saving results for $n_assets assets...")
@@ -293,108 +299,151 @@ function save_results_to_csv(all_results::Dict{Int64, Dict{String, Dict{Symbol, 
         if haskey(data_dict, "portfolio_results") && !isempty(data_dict["portfolio_results"])
             portfolio_data = data_dict["portfolio_results"]
             
-            forecasts = nothing
-            for model_type in [:rnn, :lstm]
+            # Save results for EACH model (RNN and LSTM) separately
+            for (model_type, model_name_short) in [(:rnn, "RNN"), (:lstm, "LSTM")]
                 if haskey(portfolio_data, model_type) && haskey(portfolio_data[model_type], "forecasts")
                     forecasts = portfolio_data[model_type]["forecasts"]
-                    break
-                end
-            end
-            
-            if forecasts !== nothing
-                if haskey(forecasts, "portfolio_returns") && haskey(forecasts, "portfolio_var_1")
-                    n_obs = length(forecasts["portfolio_returns"])
+                    model_name_full = portfolio_data[model_type]["model_name"]
                     
-                    var_df = DataFrame(
-                        Day = 1:n_obs,
-                        Actual_Returns = forecasts["portfolio_returns"],
-                        VaR_1_percent = forecasts["portfolio_var_1"],
-                        VaR_5_percent = forecasts["portfolio_var_5"],
-                        VaR_10_percent = forecasts["portfolio_var_10"],
-                        Portfolio_Volatility = forecasts["portfolio_volatility"],
-                        N_Assets = fill(n_assets, n_obs),
-                        Model = fill(model_name, n_obs)
-                    )
+                    println("    Processing $(model_name_full)...")
                     
-                    csv_path = joinpath(results_dir, "portfolio_var_returns_$(n_assets)_assets.csv")
-                    CSV.write(csv_path, var_df)
-                    println("    ✓ Portfolio VaR vs Returns saved: $csv_path")
-                end
-                
-                if haskey(forecasts, "var_backtest_results") && !isempty(forecasts["var_backtest_results"])
-                    backtest_df = DataFrame(
-                        Confidence_Level = Float32[],
-                        Violation_Rate = Float32[],
-                        TUFF = Int32[],
-                        LRTUFF = Float32[],
-                        LRUC = Float32[],
-                        LRIND = Float32[],
-                        LRCC = Float32[],
-                        Basel_Zone = Int32[],
-                        N_Assets = Int[],
-                        Model = String[]
-                    )
-                    
-                    for (alpha, result) in sort(collect(forecasts["var_backtest_results"]), by=x->x[1])
-                        push!(backtest_df, (
-                            alpha, result.PF, result.TUFF, result.LRTUFF,
-                            result.LRUC, result.LRIND, result.LRCC, result.BASEL,
-                            n_assets, model_name
-                        ))
+                    # 1. Save Portfolio Returns and VaR Values
+                    if haskey(forecasts, "portfolio_returns") && haskey(forecasts, "portfolio_var_1")
+                        n_obs = length(forecasts["portfolio_returns"])
+                        
+                        var_df = DataFrame(
+                            Day = 1:n_obs,
+                            Actual_Returns = forecasts["portfolio_returns"],
+                            VaR_1_percent = forecasts["portfolio_var_1"],
+                            VaR_5_percent = forecasts["portfolio_var_5"],
+                            VaR_10_percent = forecasts["portfolio_var_10"],
+                            Portfolio_Volatility = forecasts["portfolio_volatility"],
+                            N_Assets = fill(n_assets, n_obs),
+                            Model = fill(model_name_full, n_obs)
+                        )
+                        
+                        csv_path = joinpath(output_folder, "portfolio_var_returns_$(model_name_short)_$(n_assets)_assets.csv")
+                        CSV.write(csv_path, var_df)
+                        println("      ✓ Portfolio VaR vs Returns saved: $csv_path")
                     end
                     
-                    csv_path = joinpath(results_dir, "var_backtest_$(n_assets)_assets.csv")
-                    CSV.write(csv_path, backtest_df)
-                    println("    ✓ VaR backtesting results saved: $csv_path")
-                end
-                
-                if haskey(forecasts, "mv_weights")
-                    n_obs = size(forecasts["mv_weights"], 2)
-                    n_assets_actual = size(forecasts["mv_weights"], 1)
-                    
-                    weights_df = DataFrame()
-                    for i in 1:n_assets_actual
-                        weights_df[!, "Asset_$(i)_Weight"] = forecasts["mv_weights"][i, :]
+                    # 2. Save VaR Backtesting Results
+                    if haskey(forecasts, "var_backtest_results") && !isempty(forecasts["var_backtest_results"])
+                        backtest_df = DataFrame(
+                            Confidence_Level = Float32[],
+                            Violation_Rate = Float32[],
+                            TUFF = Int32[],
+                            LRTUFF = Float32[],
+                            LRUC = Float32[],
+                            LRIND = Float32[],
+                            LRCC = Float32[],
+                            Basel_Zone = String[],  # Changed to String for clarity
+                            N_Assets = Int[],
+                            Model = String[]
+                        )
+                        
+                        for (alpha, result) in sort(collect(forecasts["var_backtest_results"]), by=x->x[1])
+                            basel_str = result.BASEL == 1 ? "Green" : (result.BASEL == 0 ? "Yellow" : "Red")
+                            push!(backtest_df, (
+                                alpha, result.PF, result.TUFF, result.LRTUFF,
+                                result.LRUC, result.LRIND, result.LRCC, basel_str,
+                                n_assets, model_name_full
+                            ))
+                        end
+                        
+                        csv_path = joinpath(output_folder, "var_backtest_$(model_name_short)_$(n_assets)_assets.csv")
+                        CSV.write(csv_path, backtest_df)
+                        println("      ✓ VaR backtesting results saved: $csv_path")
                     end
-                    weights_df[!, "Day"] = 1:n_obs
-                    weights_df[!, "N_Assets"] = fill(n_assets, n_obs)
-                    weights_df[!, "Model"] = fill(model_name, n_obs)
                     
-                    csv_path = joinpath(results_dir, "mvp_weights_$(n_assets)_assets.csv")
-                    CSV.write(csv_path, weights_df)
-                    println("    ✓ MVP weights saved: $csv_path")
+                    # 3. Save Portfolio Weights
+                    if haskey(forecasts, "mv_weights")
+                        n_obs = size(forecasts["mv_weights"], 2)
+                        n_assets_actual = size(forecasts["mv_weights"], 1)
+                        
+                        weights_df = DataFrame()
+                        for i in 1:n_assets_actual
+                            weights_df[!, "Asset_$(i)_Weight"] = forecasts["mv_weights"][i, :]
+                        end
+                        weights_df[!, "Day"] = 1:n_obs
+                        weights_df[!, "N_Assets"] = fill(n_assets, n_obs)
+                        weights_df[!, "Model"] = fill(model_name_full, n_obs)
+                        
+                        csv_path = joinpath(output_folder, "mvp_weights_$(model_name_short)_$(n_assets)_assets.csv")
+                        CSV.write(csv_path, weights_df)
+                        println("      ✓ MVP weights saved: $csv_path")
+                    end
                 end
             end
         end
         
+        # 4. Save Model Performance Summary (both models together)
         if haskey(data_dict, "model_results")
             model_results = data_dict["model_results"]
             
             summary_df = DataFrame(
+                Model = String[],
                 Metric = String[],
                 Value = Any[],
-                N_Assets = Int[],
-                Model = String[]
+                N_Assets = Int[]
             )
             
             for (model_type, result) in model_results
-                model_name_full = string(model_type)
-                push!(summary_df, ("R_hat", result["r_hat"], n_assets, model_name_full))
-                push!(summary_df, ("Training_RMSE", result["train"]["rmse"], n_assets, model_name_full))
-                push!(summary_df, ("Validation_RMSE", result["validation"]["rmse"], n_assets, model_name_full))
-                push!(summary_df, ("Test_RMSE", result["test"]["rmse"], n_assets, model_name_full))
-                push!(summary_df, ("DCC_alpha", result["dcc_params"][1], n_assets, model_name_full))
-                push!(summary_df, ("DCC_beta", result["dcc_params"][2], n_assets, model_name_full))
-                push!(summary_df, ("Converged", result["converged"], n_assets, model_name_full))
+                model_name_full = result["model_name"]
+                
+                # Add all metrics for this model
+                push!(summary_df, (model_name_full, "R_hat", result["r_hat"], n_assets))
+                push!(summary_df, (model_name_full, "DCC_alpha", result["dcc_params"][1], n_assets))
+                push!(summary_df, (model_name_full, "DCC_beta", result["dcc_params"][2], n_assets))
+                push!(summary_df, (model_name_full, "Converged", result["converged"], n_assets))
+                push!(summary_df, (model_name_full, "Training_RMSE", result["train"]["rmse"], n_assets))
+                push!(summary_df, (model_name_full, "Validation_RMSE", result["validation"]["rmse"], n_assets))
+                push!(summary_df, (model_name_full, "Test_RMSE", result["test"]["rmse"], n_assets))
+                push!(summary_df, (model_name_full, "Coverage_90", result["test"]["coverage_90"], n_assets))
+                push!(summary_df, (model_name_full, "Coverage_95", result["test"]["coverage_95"], n_assets))
             end
             
-            csv_path = joinpath(results_dir, "summary_$(n_assets)_assets.csv")
+            csv_path = joinpath(output_folder, "model_summary_$(n_assets)_assets.csv")
             CSV.write(csv_path, summary_df)
-            println("    ✓ Summary metrics saved: $csv_path")
+            println("    ✓ Model summary saved: $csv_path")
+        end
+        
+        # 5. Save Portfolio Performance Comparison (both models together)
+        if haskey(data_dict, "portfolio_results")
+            portfolio_data = data_dict["portfolio_results"]
+            
+            perf_df = DataFrame(
+                Model = String[],
+                Avg_Portfolio_Return = Float64[],
+                Portfolio_Volatility = Float64[],
+                Avg_VaR_1 = Float64[],
+                Avg_VaR_5 = Float64[],
+                Avg_VaR_10 = Float64[],
+                N_Assets = Int[]
+            )
+            
+            for (model_type, result_dict) in portfolio_data
+                if haskey(result_dict, "performance")
+                    perf = result_dict["performance"]
+                    push!(perf_df, (
+                        result_dict["model_name"],
+                        perf["avg_portfolio_return"],
+                        perf["portfolio_volatility"],
+                        perf["avg_var_1"],
+                        perf["avg_var_5"],
+                        perf["avg_var_10"],
+                        n_assets
+                    ))
+                end
+            end
+            
+            csv_path = joinpath(output_folder, "portfolio_performance_$(n_assets)_assets.csv")
+            CSV.write(csv_path, perf_df)
+            println("    ✓ Portfolio performance saved: $csv_path")
         end
     end
     
-    println("All results saved in '$results_dir' directory")
+    println("\n✓ All results saved in '$output_folder' directory")
 end
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1394,8 +1443,9 @@ function comprehensive_dcc_analysis_with_portfolio(data_path::String, n_assets::
             
             if var_plot !== nothing
                 display(var_plot)
-                savefig(var_plot, "bnn_var_analysis_$(model_type)_$(n_assets)_assets.png")
-                println("  VaR analysis plot saved: bnn_var_analysis_$(model_type)_$(n_assets)_assets.png")
+                plot_filename = joinpath(OUTPUT_FOLDER, "bnn_var_analysis_$(model_type)_$(n_assets)_assets.png")
+                savefig(var_plot, plot_filename)
+                println("  VaR analysis plot saved: $plot_filename")
             end
         end
         
@@ -1407,8 +1457,9 @@ function comprehensive_dcc_analysis_with_portfolio(data_path::String, n_assets::
                               linewidth=2, color=:purple, label="MVP Volatility",
                               size=(1000, 400))
             display(mvp_vol_plot)
-            savefig(mvp_vol_plot, "bnn_mvp_evolution_$(model_type)_$(n_assets)_assets.png")
-            println("  MVP evolution plot saved: bnn_mvp_evolution_$(model_type)_$(n_assets)_assets.png")
+            vol_filename = joinpath(OUTPUT_FOLDER, "bnn_mvp_evolution_$(model_type)_$(n_assets)_assets.png")
+            savefig(mvp_vol_plot, vol_filename)
+            println("  MVP evolution plot saved: $vol_filename")
         end
     end
 
@@ -1417,7 +1468,7 @@ function comprehensive_dcc_analysis_with_portfolio(data_path::String, n_assets::
     print_var_backtesting_summary(portfolio_results, n_assets)
     
     all_results = Dict(n_assets => Dict("model_results" => results, "portfolio_results" => portfolio_results))
-    save_results_to_csv(all_results, "BNN-DCC-GARCH")
+    save_results_to_csv(all_results, OUTPUT_FOLDER)
 
     return results, portfolio_results
 end
@@ -1432,9 +1483,7 @@ asset_counts = [2, 5, 10, 15, 29, 30]
 all_results = Dict{Int64, Tuple{Dict{Symbol, Any}, Dict{Symbol, Any}}}()
 
 for n_assets in asset_counts
-    println("\n" * "="^100)
     println("RUNNING ANALYSIS FOR $n_assets ASSETS")
-    println("="^100)
     
     results, portfolio_results = comprehensive_dcc_analysis_with_portfolio(data_path, n_assets)
     all_results[n_assets] = (results, portfolio_results)

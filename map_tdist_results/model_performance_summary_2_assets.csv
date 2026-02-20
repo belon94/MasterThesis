@@ -1,0 +1,3 @@
+N_Assets,Estimation_Method,Test_RMSE,DCC_beta,Training_RMSE,Model,DCC_alpha,Nu,Distribution,Validation_RMSE
+2,MAP,2.9361765,5.304814e-6,1.9357187,Sequential RNN,2.3880903e-13,5.0,t-Distribution,1.4411117
+2,MAP,2.9276845,5.781649e-6,1.9350364,Sequential LSTM,2.3667597e-13,5.0,t-Distribution,1.442879

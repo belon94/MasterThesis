@@ -1,0 +1,4 @@
+Confidence_Level,PF,TUFF,LRUC,LRIND,LRCC,Crit_UC_5pct,Crit_UC_1pct,Crit_CC_5pct,Crit_CC_1pct,Reject_UC_5pct,Reject_UC_1pct,Reject_CC_5pct,Reject_CC_1pct,Basel_Zone
+0.01,0.02811245,111,5.533787,13.46382,18.997608,3.84,6.63,5.99,9.21,true,false,true,true,Yellow
+0.05,0.04819277,13,0.017333984,16.752457,16.76979,3.84,6.63,5.99,9.21,false,false,true,true,Green
+0.1,0.08835341,13,0.3890686,10.695169,11.084238,3.84,6.63,5.99,9.21,false,false,true,true,Green

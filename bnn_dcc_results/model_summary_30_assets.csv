@@ -1,0 +1,19 @@
+Model,Metric,Value,N_Assets
+Sequential RNN,R_hat,2.122997,30
+Sequential RNN,DCC_alpha,0.16538173,30
+Sequential RNN,DCC_beta,0.41190493,30
+Sequential RNN,Converged,false,30
+Sequential RNN,Training_RMSE,1.6464647,30
+Sequential RNN,Validation_RMSE,1.430177,30
+Sequential RNN,Test_RMSE,2.3586142,30
+Sequential RNN,Coverage_90,0.7235609103078983,30
+Sequential RNN,Coverage_95,0.7773761713520749,30
+Sequential LSTM,R_hat,2.1231196,30
+Sequential LSTM,DCC_alpha,0.11743766,30
+Sequential LSTM,DCC_beta,0.35986942,30
+Sequential LSTM,Converged,false,30
+Sequential LSTM,Training_RMSE,1.6131716,30
+Sequential LSTM,Validation_RMSE,1.36192,30
+Sequential LSTM,Test_RMSE,2.2906435,30
+Sequential LSTM,Coverage_90,0.7951807228915663,30
+Sequential LSTM,Coverage_95,0.8456492637215529,30

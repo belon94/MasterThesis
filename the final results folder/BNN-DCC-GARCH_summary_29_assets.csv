@@ -1,0 +1,15 @@
+Metric,Value,N_Assets,Model
+R_hat,2.1231194,29,rnn
+Training_RMSE,1.9992586,29,rnn
+Validation_RMSE,1.761639,29,rnn
+Test_RMSE,2.642163,29,rnn
+DCC_alpha,0.19215591,29,rnn
+DCC_beta,0.385002,29,rnn
+Converged,false,29,rnn
+R_hat,2.1231194,29,lstm
+Training_RMSE,1.4731542,29,lstm
+Validation_RMSE,1.1685185,29,lstm
+Test_RMSE,2.2837267,29,lstm
+DCC_alpha,0.13085571,29,lstm
+DCC_beta,0.39993235,29,lstm
+Converged,false,29,lstm

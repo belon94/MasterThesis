@@ -390,8 +390,6 @@ function save_results_to_csv(all_results::Dict{Int64, Dict{String, Dict{Symbol, 
             
             for (model_type, result) in model_results
                 model_name_full = result["model_name"]
-                
-                # Add all metrics for this model
                 push!(summary_df, (model_name_full, "R_hat", result["r_hat"], n_assets))
                 push!(summary_df, (model_name_full, "DCC_alpha", result["dcc_params"][1], n_assets))
                 push!(summary_df, (model_name_full, "DCC_beta", result["dcc_params"][2], n_assets))
@@ -570,10 +568,11 @@ function train_model_with_validation(model_type::Symbol, X_train, Y_train, X_val
     println("Finding MAP estimate...")
     θmap = find_mode(bnn_train, 50, 1000, FluxModeFinder(bnn_train, Flux.ADAM()))
 
-    println("Starting MCMC sampling...")
+    # ─────────────────────────────────────────────────────────────────────────
+    println("Starting MCMC sampling (initialised from MAP estimate)...")
     step_size = N <= 5 ? 1f-4 : 2f-5
     sampler = SGNHTS(step_size, 1f0; xi=1f0^2, μ=10f0)
-    ch_raw = mcmc(bnn_train, chains, mcmc_samples, sampler)
+    ch_raw = mcmc(bnn_train, chains, mcmc_samples, sampler; θstart = θmap)
 
     burn_in = mcmc_samples ÷ 2
     ch_burn_raw, ch2d = apply_burnin_and_flatten(ch_raw, burn_in)
@@ -1495,13 +1494,11 @@ println("ALL ANALYSES COMPLETE!")
 println("Results generated for asset counts: $(collect(keys(all_results)))")
 
 
-####################Parameter counting for models####################
+####################Parameter counting for models###################
 
-# Model building functions (copy from your code)
 build_rnn_model(N::Int, hidden_size::Int) = Chain(RNN(N => hidden_size), Dense(hidden_size => 2N))
 build_lstm_model(N::Int, hidden_size::Int) = Chain(LSTM(N => hidden_size), Dense(hidden_size => 2N))
 
-# Parameter counting function
 function count_parameters(net)
     total = 0
     for layer in net
@@ -1512,7 +1509,6 @@ function count_parameters(net)
     return total + 2  # Add 2 for DCC parameters (a, b)
 end
 
-# Calculate for all your models
 function print_parameter_counts()
     asset_counts = [2, 5, 10, 15, 29, 30]
     
@@ -1520,13 +1516,11 @@ function print_parameter_counts()
     println("="^60)
     
     for n_assets in asset_counts
-        hidden_size = max(16, min(32, 4 * n_assets))
+        hidden_size = max(16, min(64, 4 * n_assets))
         
-        # RNN model
         rnn_net = build_rnn_model(n_assets, hidden_size)
         rnn_params = count_parameters(rnn_net)
         
-        # LSTM model  
         lstm_net = build_lstm_model(n_assets, hidden_size)
         lstm_params = count_parameters(lstm_net)
         
@@ -1537,5 +1531,4 @@ function print_parameter_counts()
     end
 end
 
-# Run it
 print_parameter_counts()

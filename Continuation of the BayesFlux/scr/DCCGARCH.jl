@@ -1,5 +1,5 @@
 #######################################################################################
-#   Classical DCC-GARCH(1,1) - Complete Multi-Asset [2, 5, 10, 15, 30]
+#   Classical DCC-GARCH(1,1) - Complete Multi-Asset [2, 5, 10, 15,29, 30]
 #   with 30 Assets, DCC and GARCH(1,1) Estimation fails to converge all the time (perhaps due to numerical issue and high dimensionality)
 #  I should keep  the Classical DCC-GARCH as Benchmark Model
 # 
